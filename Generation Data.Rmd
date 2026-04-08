@@ -1,0 +1,591 @@
+---
+title: "Generation Data"
+output: html_document
+---
+
+# Generate Within Set Covariance
+```{r}
+power_law_sigma <- function(c = 1, a = -1, p) {
+  i <- seq_len(p)
+  c * (i ^ a)
+}
+
+generate_within_set_cov <- function(c_x = 1, c_y = 1, a_x = -1, a_y = -1, p_x, p_y) {
+  Sigma_x <- power_law_sigma(c_x, a_x, p_x) # Vector
+  Sigma_y <- power_law_sigma(c_y, a_y, p_y)
+  list(Sigma_x = Sigma_x, Sigma_y = Sigma_y)
+}
+```
+
+# Generate Orthonormal U and V
+```{r}
+generate_UV_qr <- function(p_x, p_y, k) {
+  
+  U_k <- qr.Q(qr(matrix(rnorm(p_x * k), nrow = p_x, ncol = k)), complete = FALSE)
+  V_k <- qr.Q(qr(matrix(rnorm(p_y * k), nrow = p_y, ncol = k)), complete = FALSE)
+  
+  list(U_k = U_k, V_k = V_k)
+}
+```
+
+# Compute Weights from U and V
+```{r}
+# Compute weights from U and V
+compute_W_from_UV <- function(Sigma_x, Sigma_y, U, V) {
+  
+  W_X <- diag(1 / sqrt(Sigma_x)) %*% U
+  W_Y <- diag(1 / sqrt(Sigma_y)) %*% V
+  
+  list(W_X = W_X, W_Y = W_Y)
+}
+```
+
+# Generate Between Set 
+```{r}
+compute_Sigma_XY_from_UVS <- function(Sigma_x, Sigma_y, U, V, r_true, k) {
+  
+  Sigma_XY <- diag(sqrt(Sigma_x)) %*% U %*% diag(r_true) %*% t(V) %*% diag(sqrt(Sigma_y))
+  
+  Sigma_XY
+}
+```
+
+# Assemble Joint Cov
+```{r}
+assemble_joint_cov <- function(Sigma_x, Sigma_y, Sigma_XY) {
+  
+  Sigma_X <- diag(Sigma_x)
+  Sigma_Y <- diag(Sigma_y)
+  
+  Sigma <- rbind(
+    cbind(Sigma_X, Sigma_XY),
+    cbind(t(Sigma_XY), Sigma_Y)
+  )
+  
+  return(Sigma)
+}
+```
+
+# Constraint
+```{r}
+mat_inv_sqrt_symm <- function(M) {
+  ei <- eigen(M, symmetric = TRUE)
+  return(ei$vectors %*% (1/sqrt(ei$values) * t(ei$vectors)))
+}
+
+check_constraint <- function(W, Sigma, p, k) {
+  
+  # Normalize weight matrix
+  W_tilde <- W %*% mat_inv_sqrt_symm(crossprod(W))
+  
+  lhs <- sum(diag(crossprod(W_tilde, diag(Sigma)) %*% W_tilde))
+  
+  # Compute threshold
+  rhs <- 0.5 * k * sum(Sigma) / p
+  
+  # Return whether constraint was satisfied
+  return(lhs > rhs)
+}
+```
+
+# Combined Simulator
+```{r}
+generate_cca_population <- function(c_x = 1, c_y = 1, a_x = -1, a_y = -1,
+                               p_x, p_y, r_true, max_attempts = 50) {
+  
+  k <- length(r_true)
+  attempts <- 0
+  success <- FALSE
+  
+  # Within set covariances
+  covs <- generate_within_set_cov(c_x, c_y, a_x, a_y, p_x, p_y)
+  Sigma_x <- covs$Sigma_x
+  Sigma_y <- covs$Sigma_y
+  
+  uv <- generate_UV_qr(p_x, p_y, k)
+  U <- uv$U_k
+  V <- uv$V_k
+  
+  W <- compute_W_from_UV(Sigma_x, Sigma_y, U, V)
+  W_X <- W$W_X
+  W_Y <- W$W_Y
+  
+  # Between set covariance
+  Sigma_XY <- compute_Sigma_XY_from_UVS(Sigma_x, Sigma_y, U, V, r_true, k)
+    
+  # Joint covariance
+  Sigma <- assemble_joint_cov(Sigma_x, Sigma_y, Sigma_XY)
+  
+  list(
+    W_X = W_X,
+    W_Y = W_Y,
+    p_x = p_x,
+    p_y = p_y,
+    r_true = r_true,
+    joint_cov = Sigma
+  )
+}
+```
+
+# Generate Joint Data
+```{r}
+generate_joint_data <- function(joint_cov, n, p_x) {
+  p_total <- ncol(joint_cov)
+  
+  Z <- MASS::mvrnorm(n, mu = rep(0, p_total), Sigma = joint_cov)
+  
+  list(
+    X = Z[, 1:p_x],
+    Y = Z[, (p_x + 1):p_total]
+  )
+}
+```
+
+# Weights Approach
+
+# Generate within set covariance
+```{r}
+# power-law eigenvalue/spectrum vector sigma_i = c * i^{-a}
+power_law_sigma <- function(c, a, p) {
+  stopifnot(length(c) == 1, length(a) == 1, length(p) == 1)
+  if (!is.numeric(c) || !is.numeric(a) || !is.numeric(p)) stop("c, a, p must be numeric.")
+  if (p <= 0 || p != as.integer(p)) stop("p must be a positive integer.")
+  if (c <= 0) stop("c must be > 0 to make a valid covariance.")
+  
+  i <- seq_len(p)
+  sigma <- c * (i ^ (a))
+  return(sigma)
+}
+
+# generate Sigma_XX and Sigma_YY (both diagonal)
+generate_within_set_cov <- function(c_xx, c_yy, a_xx, a_yy, p_x, p_y,
+                                    check_monotone = TRUE) {
+  sigma_x <- power_law_sigma(c = c_xx, a = a_xx, p = p_x)
+  sigma_y <- power_law_sigma(c = c_yy, a = a_yy, p = p_y)
+  
+  if (any(!is.finite(sigma_x)) || any(!is.finite(sigma_y))) {
+    stop("Non-finite values in sigma. Check c/a/p.")
+  }
+  if (any(sigma_x <= 0) || any(sigma_y <= 0)) {
+    stop("All sigma entries must be > 0 for a valid (PD) diagonal covariance.")
+  }
+  
+  if (check_monotone) {
+    # "Decay" here means sigma_1 >= sigma_2 >= ... >= sigma_p
+    if (any(diff(sigma_x) > 0)) warning("sigma_x is not non-increasing; check sign/magnitude of a_xx.")
+    if (any(diff(sigma_y) > 0)) warning("sigma_y is not non-increasing; check sign/magnitude of a_yy.")
+  }
+  
+  Sigma_xx <- diag(sigma_x, nrow = p_x, ncol = p_x)
+  Sigma_yy <- diag(sigma_y, nrow = p_y, ncol = p_y)
+  
+  return(list(
+    Sigma_XX = Sigma_xx,
+    Sigma_YY = Sigma_yy,
+    sigma_XX = sigma_x,
+    sigma_YY = sigma_y
+  ))
+}
+```
+
+# Generate weights (1-dim)
+```{r}
+# important: don't run this chunk for multivariate CCA simulations
+# draw one unit Euclidean vector
+draw_unit_vector <- function(p) {
+  z <- rnorm(p)
+  nz <- sqrt(sum(z^2))
+  if (nz == 0) stop("Zero-norm draw (extremely unlikely).")
+  z / nz
+}
+
+# quadratic form for diagonal Sigma
+quad_form_diag <- function(w, sigma) {
+  sum(sigma * w^2)
+}
+
+# Eq (11) check
+passes_eq11 <- function(tilde_w, sigma, factor = 1/2) {
+  p <- ncol(sigma)
+  lhs <- quad_form_diag(tilde_w, sigma)
+  rhs <- factor * (sum(sigma) / p)  # factor * tr(Sigma)/p
+  list(pass = (lhs > rhs), lhs = lhs, rhs = rhs)
+}
+
+# Eq (10) normalization
+normalize_eq10 <- function(tilde_w, sigma) {
+  denom2 <- quad_form_diag(tilde_w, sigma)  # tilde_w^T Sigma tilde_w
+  if (denom2 <= 0) stop("Non-positive quadratic form; sigma must be > 0.")
+  tilde_w / sqrt(denom2)
+}
+
+# generate a CCA weight vector
+generate_weight_one_mode <- function(sigma, factor = 1/2, max_tries = 100000, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  p <- ncol(sigma)
+  if (any(sigma < 0)) stop("All sigma entries must be > 0.")
+
+  for (k in seq_len(max_tries)) {
+    tilde_w <- draw_unit_vector(p)          # ||tilde_w||_2 = 1
+    chk <- passes_eq11(tilde_w, sigma, factor = factor)
+    if (chk$pass) {
+      w <- normalize_eq10(tilde_w, sigma)   # now w^T Sigma w = 1
+
+      return(list(
+        tilde_w = tilde_w,
+        w = w,
+        tries = k,
+        eq11_lhs = chk$lhs,
+        eq11_rhs = chk$rhs
+      ))
+    }
+  }
+  stop("Failed to find a tilde_w passing Eq (11) within max_tries. Consider lowering factor or max_tries.")
+}
+
+# generate both W_X and W_Y (rank-1)
+generate_Wx_Wy_eq10eq11 <- function(sigma_xx, sigma_yy, factor = 1/2, max_tries = 100000, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  out_x <- generate_weight_one_mode(sigma_xx, factor = factor, max_tries = max_tries)
+  out_y <- generate_weight_one_mode(sigma_yy, factor = factor, max_tries = max_tries)
+  list(
+    W_X = matrix(out_x$w, ncol = 1),
+    W_Y = matrix(out_y$w, ncol = 1),
+    details_X = out_x,
+    details_Y = out_y
+  )
+}
+```
+
+# Generate weights (multi-dim)
+```{r}
+# important: don't run this chunk for univariate CCA simulations
+# draw one unit Euclidean vector
+draw_unit_vector <- function(p) {
+  z <- rnorm(p)
+  nz <- sqrt(sum(z^2))
+  if (nz == 0) stop("Zero-norm draw (extremely unlikely).")
+  z / nz
+}
+
+# draw p x r matrix with Euclidean-orthonormal columns
+draw_orthonormal_matrix <- function(p, r) {
+  Z <- matrix(rnorm(p * r), nrow = p, ncol = r)
+  qr.Q(qr(Z), complete = FALSE)
+}
+
+# helper: trace(Sigma) for either a full matrix or diagonal vector
+trace_sigma <- function(sigma) {
+  if (is.vector(sigma)) return(sum(sigma))
+  sum(diag(sigma))
+}
+
+# helper: number of rows / columns in Sigma
+sigma_dim <- function(sigma) {
+  if (is.vector(sigma)) return(length(sigma))
+  ncol(sigma)
+}
+
+# quadratic form w^T Sigma w for one vector
+quad_form_diag <- function(w, sigma) {
+  if (is.vector(sigma)) {
+    sum(sigma * w^2)
+  } else {
+    as.numeric(crossprod(w, sigma %*% w))
+  }
+}
+
+# matrix quadratic form trace(W^T Sigma W)
+quad_form_diag_mat <- function(W, sigma) {
+  W <- as.matrix(W)
+  if (is.vector(sigma)) {
+    sum(W^2 * sigma)
+  } else {
+    sum(diag(crossprod(W, sigma %*% W)))
+  }
+}
+
+# inverse square root of a small SPD matrix
+mat_inv_sqrt_spd_small <- function(M, tol = 1e-12) {
+  eig <- eigen((M + t(M)) / 2, symmetric = TRUE)
+  vals <- eig$values
+  vecs <- eig$vectors
+
+  if (any(vals <= tol)) {
+    stop("Matrix is not sufficiently positive definite for inverse square root.")
+  }
+
+  vecs %*% diag(1 / sqrt(vals), nrow = length(vals)) %*% t(vecs)
+}
+
+# Eq (11) check for multi-mode tilde_W
+# natural r-dimensional extension:
+# tr(tilde_W^T Sigma tilde_W) > factor * r * tr(Sigma) / p
+passes_eq11_multi <- function(tilde_W, sigma, factor = 1/2) {
+  tilde_W <- as.matrix(tilde_W)
+  p <- sigma_dim(sigma)
+  r <- ncol(tilde_W)
+
+  if (nrow(tilde_W) != p) {
+    stop("tilde_W row dimension must match Sigma dimension.")
+  }
+
+  lhs <- quad_form_diag_mat(tilde_W, sigma)
+  rhs <- factor * r * trace_sigma(sigma) / p
+
+  list(pass = (lhs > rhs), lhs = lhs, rhs = rhs)
+}
+
+# Eq (10) normalization for matrix weights:
+# W = tilde_W (tilde_W^T Sigma tilde_W)^(-1/2)
+# so that W^T Sigma W = I_r
+normalize_eq10_matrix <- function(tilde_W, sigma, tol = 1e-12) {
+  tilde_W <- as.matrix(tilde_W)
+
+  if (is.vector(sigma)) {
+    G <- crossprod(tilde_W, sweep(tilde_W, 1, sigma, "*"))
+  } else {
+    G <- crossprod(tilde_W, sigma %*% tilde_W)
+  }
+
+  G_inv_sqrt <- mat_inv_sqrt_spd_small(G, tol = tol)
+  tilde_W %*% G_inv_sqrt
+}
+
+# generate a CCA weight matrix W with r columns
+generate_weight_multi_mode <- function(sigma, r,
+                                       factor = 1/2,
+                                       max_tries = 100000,
+                                       seed = NULL,
+                                       tol = 1e-12) {
+  if (!is.null(seed)) set.seed(seed)
+
+  p <- sigma_dim(sigma)
+  if (r > p) stop("r must be <= p.")
+
+  if (is.vector(sigma)) {
+    if (any(sigma <= 0)) stop("All sigma diagonal entries must be > 0.")
+  } else {
+    if (!is.matrix(sigma) || nrow(sigma) != ncol(sigma)) {
+      stop("sigma must be a square covariance matrix (or diagonal vector).")
+    }
+  }
+
+  for (k in seq_len(max_tries)) {
+    tilde_W <- draw_orthonormal_matrix(p, r)   # tilde_W^T tilde_W = I_r
+    chk <- passes_eq11_multi(tilde_W, sigma, factor = factor)
+
+    if (chk$pass) {
+      W <- normalize_eq10_matrix(tilde_W, sigma, tol = tol)  # now W^T Sigma W = I_r
+
+      return(list(
+        tilde_W = tilde_W,
+        W = W,
+        tries = k,
+        eq11_lhs = chk$lhs,
+        eq11_rhs = chk$rhs
+      ))
+    }
+  }
+
+  stop("Failed to find a tilde_W passing multivariate Eq (11) within max_tries.")
+}
+
+# generate both W_X and W_Y for rank-r CCA
+generate_Wx_Wy_eq10eq11 <- function(sigma_xx, sigma_yy, r = 3,
+                                    factor = 1/2,
+                                    max_tries = 100000,
+                                    seed = NULL,
+                                    tol = 1e-12) {
+  if (!is.null(seed)) set.seed(seed)
+
+  out_x <- generate_weight_multi_mode(
+    sigma = sigma_xx,
+    r = r,
+    factor = factor,
+    max_tries = max_tries,
+    seed = NULL,
+    tol = tol
+  )
+
+  out_y <- generate_weight_multi_mode(
+    sigma = sigma_yy,
+    r = r,
+    factor = factor,
+    max_tries = max_tries,
+    seed = NULL,
+    tol = tol
+  )
+
+  list(
+    W_X = out_x$W,
+    W_Y = out_y$W,
+    details_X = out_x,
+    details_Y = out_y
+  )
+}
+```
+
+# Compute U, V, and S
+```{r}
+mat_sqrt_spd <- function(Sigma, inverse = FALSE, tol = 1e-12) {
+  # If Sigma is given as diagonal entries
+  if (is.vector(Sigma)) {
+    if (any(Sigma <= 0)) stop("Diagonal entries must be > 0.")
+    d <- if (!inverse) sqrt(Sigma) else 1 / sqrt(Sigma)
+    return(diag(d, nrow = length(d), ncol = length(d)))
+  }
+  
+  # Sigma is a matrix
+  if (!is.matrix(Sigma)) stop("Sigma must be a vector (diag) or a matrix.")
+  if (nrow(Sigma) != ncol(Sigma)) stop("Sigma must be square.")
+  
+  # Fast path: (approximately) diagonal
+  off_diag <- Sigma
+  diag(off_diag) <- 0
+  if (max(abs(off_diag)) < tol) {
+    d0 <- diag(Sigma)
+    if (any(d0 <= 0)) stop("Diagonal entries must be > 0.")
+    d <- if (!inverse) sqrt(d0) else 1 / sqrt(d0)
+    return(diag(d, nrow = length(d), ncol = length(d)))
+  }
+  
+  # eigen decomposition
+  eig <- eigen(Sigma, symmetric = TRUE)
+  if (any(eig$values <= tol)) stop("Sigma not SPD (non-positive eigenvalues).")
+  vals <- if (!inverse) sqrt(eig$values) else 1 / sqrt(eig$values)
+  eig$vectors %*% diag(vals) %*% t(eig$vectors)
+}
+
+# For rank-1 (m=1) or multi-mode if r is a vector of length m
+compute_uvs_from_weights <- function(Sigma_XX, Sigma_YY, W_X, W_Y, r_true) {
+  if (!is.matrix(W_X)) W_X <- matrix(W_X, ncol = 1)
+  if (!is.matrix(W_Y)) W_Y <- matrix(W_Y, ncol = 1)
+  m <- ncol(W_X)
+  if (ncol(W_Y) != m) stop("W_X and W_Y must have the same number of columns (m).")
+  
+  # S
+  if (length(r_true) == 1) {
+    S <- diag(rep(r_true, m), nrow = m, ncol = m)
+  } else {
+    if (length(r_true) != m) stop("If r_true is a vector, it must have length m.")
+    S <- diag(r_true, nrow = m, ncol = m)
+  }
+  
+  sqrt_x <- mat_sqrt_spd(Sigma_XX, inverse = FALSE)
+  sqrt_y <- mat_sqrt_spd(Sigma_YY, inverse = FALSE)
+  
+  U <- sqrt_x %*% W_X
+  V <- sqrt_y %*% W_Y
+  
+  list(U = U, V = V, S = S)
+}
+```
+
+# Generate between set covariance
+```{r}
+# Generate between-set covariance Sigma_XY for CCA
+generate_Sigma_XY <- function(Sigma_XX, Sigma_YY, W_X, W_Y, r_true,
+                              allow_negative = FALSE) {
+  # Coerce weights to matrices
+  if (!is.matrix(W_X)) W_X <- matrix(W_X, ncol = 1)
+  if (!is.matrix(W_Y)) W_Y <- matrix(W_Y, ncol = 1)
+
+  p_x <- nrow(W_X)
+  p_y <- nrow(W_Y)
+  m   <- ncol(W_X)
+  if (ncol(W_Y) != m) stop("W_X and W_Y must have the same number of columns (m).")
+
+  # r_true to S
+  if (length(r_true) == 1) {
+    r_vec <- rep(r_true, m)
+  } else {
+    if (length(r_true) != m) stop("If r_true is a vector, it must have length m.")
+    r_vec <- r_true
+  }
+
+  if (!allow_negative && any(r_vec < 0)) stop("CCA uses nonnegative canonical correlations; r_true should be >= 0.")
+  if (any(abs(r_vec) >= 1)) stop("Need |r_true| < 1 for a valid joint covariance (strict PD typically).")
+
+  S <- diag(r_vec, nrow = m, ncol = m)
+
+  # Decide if Sigma_XX / Sigma_YY are diagonal vectors or full matrices
+  is_diagvec_x <- is.vector(Sigma_XX) && !is.list(Sigma_XX)
+  is_diagvec_y <- is.vector(Sigma_YY) && !is.list(Sigma_YY)
+
+  if (is_diagvec_x) {
+    if (length(Sigma_XX) != p_x) stop("Length of diagonal vector Sigma_XX must equal nrow(W_X).")
+    if (any(Sigma_XX <= 0)) stop("Sigma_XX diagonal entries must be > 0.")
+    # A = Sigma_XX W_X = diag(sigma_x) W_X  (rowwise multiply)
+    A <- sweep(W_X, 1, Sigma_XX, "*")
+  } else {
+    if (!is.matrix(Sigma_XX) || nrow(Sigma_XX) != p_x || ncol(Sigma_XX) != p_x)
+      stop("Sigma_XX must be p_x x p_x matrix or length p_x diagonal vector.")
+    A <- Sigma_XX %*% W_X
+  }
+
+  if (is_diagvec_y) {
+    if (length(Sigma_YY) != p_y) stop("Length of diagonal vector Sigma_YY must equal nrow(W_Y).")
+    if (any(Sigma_YY <= 0)) stop("Sigma_YY diagonal entries must be > 0.")
+    # B = Sigma_YY W_Y = diag(sigma_y) W_Y
+    B <- sweep(W_Y, 1, Sigma_YY, "*")
+  } else {
+    if (!is.matrix(Sigma_YY) || nrow(Sigma_YY) != p_y || ncol(Sigma_YY) != p_y)
+      stop("Sigma_YY must be p_y x p_y matrix or length p_y diagonal vector.")
+    B <- Sigma_YY %*% W_Y
+  }
+  
+  Sigma_XY <- A %*% S %*% t(B)
+  return(Sigma_XY)
+}
+
+```
+
+# Generate covariance
+```{r}
+assemble_joint_cov <- function(Sigma_XX, Sigma_YY, Sigma_XY) {
+  # Determine dimensions
+  p_x <- nrow(Sigma_XY)
+  p_y <- ncol(Sigma_XY)
+
+  # Convert Sigma_XX
+  if (is.vector(Sigma_XX) && !is.list(Sigma_XX)) {
+    if (length(Sigma_XX) != p_x) stop("Length of Sigma_XX diagonal vector must equal nrow(Sigma_XY).")
+    Sigma_xx_mat <- diag(Sigma_XX, nrow = p_x, ncol = p_x)
+  } else {
+    if (!is.matrix(Sigma_XX) || nrow(Sigma_XX) != p_x || ncol(Sigma_XX) != p_x) {
+      stop("Sigma_XX must be p_x x p_x matrix or length p_x diagonal vector.")
+    }
+    Sigma_xx_mat <- Sigma_XX
+  }
+
+  # Convert Sigma_YY
+  if (is.vector(Sigma_YY) && !is.list(Sigma_YY)) {
+    if (length(Sigma_YY) != p_y) stop("Length of Sigma_YY diagonal vector must equal ncol(Sigma_XY).")
+    Sigma_yy_mat <- diag(Sigma_YY, nrow = p_y, ncol = p_y)
+  } else {
+    if (!is.matrix(Sigma_YY) || nrow(Sigma_YY) != p_y || ncol(Sigma_YY) != p_y) {
+      stop("Sigma_YY must be p_y x p_y matrix or length p_y diagonal vector.")
+    }
+    Sigma_yy_mat <- Sigma_YY
+  }
+
+  # Assemble
+  Sigma <- rbind(
+    cbind(Sigma_xx_mat, Sigma_XY),
+    cbind(t(Sigma_XY), Sigma_yy_mat)
+  )
+
+  # Symmetrize to remove tiny numerical asymmetry
+  Sigma <- (Sigma + t(Sigma)) / 2
+  Sigma
+}
+
+# Quick PD check using Cholesky
+is_pos_def <- function(Sigma) {
+  Sigma <- (Sigma + t(Sigma)) / 2
+  ok <- TRUE
+  chol_try <- tryCatch(chol(Sigma), error = function(e) { ok <<- FALSE; NULL })
+  ok
+}
+```

@@ -1,0 +1,197 @@
+---
+title: "Metrics"
+output: html_document
+---
+
+# Power
+```{r}
+compute_power <- function(joint_cov , p_x, n = 100, 
+                          num_datasets = 100, 
+                          num_permutations = 100,
+                          alpha = 0.05, k) {
+  
+  # num_datasets x k 
+  success_bonf <- matrix(0, nrow = num_datasets, ncol = k)
+
+  for (d in 1:num_datasets) {
+    
+    # Generate datasets 
+    data <- generate_joint_data(joint_cov, n, p_x)
+    
+    r_obs_all <- cancor(data$X, data$Y)$cor[1:k]
+    
+    # k x num_perm
+    r_null_matrix <- replicate(num_permutations, {
+      Y_perm <- data$Y[sample.int(n), , drop = FALSE]
+      cancor(data$X, Y_perm)$cor[1:k]
+    })
+
+    # Calculate p values
+    # Computes the number of times the the r_null corr is >= to the corr_obs / num_perm + 1
+    for (j in 1:k) {
+      p_val_j <- (sum(r_null_matrix[j, ] >= r_obs_all[j]) + 1) / (num_permutations + 1)
+      
+      if (p_val_j < alpha / k) success_bonf[d, j] <- 1
+    }
+  }
+  
+  return(colMeans(success_bonf))
+  
+}
+```
+
+# Solve CCA
+```{r}
+solve_cca_dataset <- function(joint_cov, n = 100, p_x, k) {
+  
+  # Generate data
+  data <- generate_joint_data(joint_cov, n, p_x)
+  X <- data$X
+  Y <- data$Y
+  
+  # Compute CCA using cancor
+  cca_res <- cancor(X, Y)
+  
+  # Canonical weights
+  WX_hat_k <- cca_res$xcoef[, 1:k, drop = FALSE]
+  WY_hat_k <- cca_res$ycoef[, 1:k, drop = FALSE]
+  
+  # Canonical correlations
+  r_obs_all <- cca_res$cor[1:k]
+  
+  # Canonical scores
+  scores_X <- scale(X, center = TRUE, scale = FALSE) %*% WX_hat_k
+  scores_Y <- scale(Y, center = TRUE, scale = FALSE) %*% WY_hat_k
+  
+  list(
+    WX_hat = WX_hat_k,
+    WY_hat = WY_hat_k,
+    r_obs = r_obs_all,
+    scores_X = scores_X,
+    scores_Y = scores_Y,
+    joint_cov = joint_cov,
+    p_x = p_x,
+    n = n 
+  )
+}
+```
+
+# Relative Correlation Error
+```{r}
+relative_error <- function(r_est, r_true) {
+  
+  (r_est - r_true) / r_true
+}
+```
+
+# Cossim Similarity
+```{r}
+cos_similarity_k <- function(W_hat, W_true) {
+  
+  # Calculates cossim similarity for 2 weight matrices
+  
+  norm_hat <- sqrt(colSums(W_hat^2)) # Vector
+  norm_true <- sqrt(colSums(W_true^2))
+  
+  # Element wise multiplication and summing over cols
+  dot_products <- colSums(W_hat * W_true)
+
+  cos_theta <- dot_products / (norm_hat * norm_true) # Vector
+  
+  pmin(pmax(cos_theta, -1), 1)
+}
+```
+
+# Weight Error
+```{r}
+weight_error_k <- function(WX_hat, WY_hat, WX_true, WY_true) {
+  
+  # Compute 1 - |cos| for each dimension
+  err_X <- 1 - abs(cos_similarity_k(WX_hat, WX_true))
+  err_Y <- 1 - abs(cos_similarity_k(WY_hat, WY_true))
+  
+  # Parallel max
+  pmax(err_X, err_Y)
+}
+```
+
+# Score and Loading Error
+```{r}
+center_cols <- function(M) sweep(M, 2, colMeans(M), "-")
+```
+
+```{r}
+score_loading_error_k <- function(cca_fit, WX_true, WY_true) {
+
+  # Generate test data
+  test_data <- generate_joint_data(cca_fit$joint_cov, cca_fit$n, cca_fit$p_x)
+  
+  # Compute scores
+  sX_hat  <- test_data$X %*% cca_fit$WX_hat # n x k
+  sX_true <- test_data$X %*% WX_true
+  sY_hat  <- test_data$Y %*% cca_fit$WY_hat
+  sY_true <- test_data$Y %*% WY_true
+  
+  # Column center
+  sX_hat  <- center_cols(sX_hat)
+  sX_true <- center_cols(sX_true)
+  sY_hat  <- center_cols(sY_hat)
+  sY_true <- center_cols(sY_true)
+  
+  # Score error
+  err_score_X <- 1 - abs(cos_similarity_k(sX_hat, sX_true))
+  err_score_Y <- 1 - abs(cos_similarity_k(sY_hat, sY_true))
+  score_err   <- pmax(err_score_X, err_score_Y)
+  
+  # Compute loading error
+  compute_load_err <- function(X, s_hat, s_true) {
+    est_load  <- cor(X, s_hat) # p x k
+    true_load <- cor(X, s_true)
+    
+    est_load  <- center_cols(est_load)
+    true_load <- center_cols(true_load)
+    
+    1 - abs(cos_similarity_k(est_load, true_load))
+  }
+  
+  loading_err <- pmax(
+    compute_load_err(test_data$X, sX_hat, sX_true),
+    compute_load_err(test_data$Y, sY_hat, sY_true)
+  )
+  
+  list(score = score_err, loading = loading_err)
+}
+```
+
+# Weight Stability, Cosine Similarity, and PC1
+```{r}
+if (!exists("cos_sim")) {
+  cos_sim <- function(a, b) {
+    a <- as.numeric(a); b <- as.numeric(b)
+    sum(a*b) / (sqrt(sum(a^2))*sqrt(sum(b^2)) + 1e-12)
+  }
+}
+
+# E|cos(u, e1)| for random unit u in R^p
+expected_abs_cos_random <- function(p) {
+  if (p <= 1) return(1)
+  2/(p - 1) * exp(lgamma(p/2) - 0.5*log(pi) - lgamma((p - 1)/2))
+}
+
+pc1_from_cov <- function(Sxx) {
+  eg <- eigen(Sxx, symmetric = TRUE)
+  v <- eg$vectors[, 1]
+  as.numeric(v / sqrt(sum(v^2)))
+}
+
+stability_from_xy_weight_matrices <- function(WX, WY) {
+  WX <- sweep(WX, 2, sqrt(colSums(WX^2)), "/")
+  WY <- sweep(WY, 2, sqrt(colSums(WY^2)), "/")
+  
+  GX <- abs(crossprod(WX))
+  GY <- abs(crossprod(WY))
+  
+  idx <- upper.tri(GX)
+  mean(pmin(GX[idx], GY[idx]))
+}
+```

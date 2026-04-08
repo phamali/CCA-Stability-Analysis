@@ -1,0 +1,1783 @@
+---
+title: "Plot Final"
+output: html_document
+---
+
+```{r}
+library(MASS)
+library(CCA)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tidyverse)
+library(patchwork)
+library(mvtnorm)
+library(parallel)
+library(scales)
+library(purrr)
+library(grid)
+library(gridExtra)
+library(future.apply)
+library(future)
+```
+
+# Generate Within Set Covariance
+```{r}
+power_law_sigma <- function(c = 1, a = -1, p) {
+  i <- seq_len(p)
+  c * (i ^ a)
+}
+
+generate_within_set_cov <- function(c_x = 1, c_y = 1, a_x = -1, a_y = -1, p_x, p_y) {
+  Sigma_x <- power_law_sigma(c_x, a_x, p_x) # Vector
+  Sigma_y <- power_law_sigma(c_y, a_y, p_y)
+  list(Sigma_x = Sigma_x, Sigma_y = Sigma_y)
+}
+```
+
+# Generate Orthonormal U and V
+```{r}
+generate_UV_qr <- function(p_x, p_y, k) {
+  
+  U_k <- qr.Q(qr(matrix(rnorm(p_x * k), nrow = p_x, ncol = k)), complete = FALSE)
+  V_k <- qr.Q(qr(matrix(rnorm(p_y * k), nrow = p_y, ncol = k)), complete = FALSE)
+  
+  list(U_k = U_k, V_k = V_k)
+}
+```
+
+# Compute Weights from U and V
+```{r}
+compute_W_from_UV <- function(Sigma_x, Sigma_y, U, V) {
+  
+  W_X <- diag(1 / sqrt(Sigma_x)) %*% U
+  W_Y <- diag(1 / sqrt(Sigma_y)) %*% V
+  
+  list(W_X = W_X, W_Y = W_Y)
+}
+```
+
+# Generate Between Set 
+```{r}
+compute_Sigma_XY_from_UVS <- function(Sigma_x, Sigma_y, U, V, r_true, k) {
+  
+  if (k == 1) {
+    S <- matrix(r_true, nrow = 1, ncol = 1)
+  } else {
+    S <- diag(r_true, nrow = k)
+  }
+  
+  Sigma_XY <- diag(sqrt(Sigma_x)) %*% U %*% S %*% t(V) %*% diag(sqrt(Sigma_y))
+  
+  return(Sigma_XY)
+}
+```
+
+# Assemble Joint Cov
+```{r}
+assemble_joint_cov <- function(Sigma_x, Sigma_y, Sigma_XY) {
+  
+  Sigma_X <- diag(Sigma_x)
+  Sigma_Y <- diag(Sigma_y)
+  
+  Sigma <- rbind(
+    cbind(Sigma_X, Sigma_XY),
+    cbind(t(Sigma_XY), Sigma_Y)
+  )
+  
+  return(Sigma)
+}
+```
+
+# Combined Simulator
+```{r}
+generate_cca_population <- function(c_x = 1, c_y = 1, a_x = -1, a_y = -1,
+                               p_x, p_y, r_true) {
+  
+  r_true <- as.numeric(r_true)
+  k <- length(r_true)
+  
+  # Within set covariances
+  covs <- generate_within_set_cov(c_x, c_y, a_x, a_y, p_x, p_y)
+  Sigma_x <- covs$Sigma_x
+  Sigma_y <- covs$Sigma_y
+  
+  uv <- generate_UV_qr(p_x, p_y, k)
+  U <- uv$U_k
+  V <- uv$V_k
+  
+  W <- compute_W_from_UV(Sigma_x, Sigma_y, U, V)
+  W_X <- W$W_X
+  W_Y <- W$W_Y
+  
+  # Between set covariance
+  Sigma_XY <- compute_Sigma_XY_from_UVS(Sigma_x, Sigma_y, U, V, r_true, k)
+    
+  # Joint covariance
+  Sigma <- assemble_joint_cov(Sigma_x, Sigma_y, Sigma_XY)
+  
+  list(
+    W_X = W_X,
+    W_Y = W_Y,
+    p_x = p_x,
+    p_y = p_y,
+    r_true = r_true,
+    joint_cov = Sigma
+  )
+}
+```
+
+# Generate Joint Data
+```{r}
+generate_joint_data <- function(joint_cov, n, p_x) {
+  p_total <- ncol(joint_cov)
+  
+  Z <- MASS::mvrnorm(n, mu = rep(0, p_total), Sigma = joint_cov)
+  
+  list(
+    X = Z[, 1:p_x],
+    Y = Z[, (p_x + 1):p_total]
+  )
+}
+```
+
+# Power
+```{r}
+compute_power <- function(joint_cov , p_x, n = 100, 
+                          num_datasets = 100, 
+                          num_permutations = 100,
+                          alpha = 0.05, k) {
+  
+  # num_datasets x k 
+  success_bonf <- matrix(0, nrow = num_datasets, ncol = k)
+
+  for (d in 1:num_datasets) {
+    
+    # Generate datasets 
+    data <- generate_joint_data(joint_cov, n, p_x)
+    
+    r_obs_all <- cancor(data$X, data$Y)$cor[1:k]
+    
+    # k x num_perm
+    r_null_matrix <- replicate(num_permutations, {
+      Y_perm <- data$Y[sample.int(n), , drop = FALSE]
+      cancor(data$X, Y_perm)$cor[1:k]
+    })
+
+    # Calculate p values
+    # Computes the number of times the the r_null corr is >= to the corr_obs / num_perm + 1
+    for (j in 1:k) {
+      p_val_j <- (sum(r_null_matrix[j, ] >= r_obs_all[j]) + 1) / (num_permutations + 1)
+      
+      if (p_val_j < alpha / k) success_bonf[d, j] <- 1
+    }
+  }
+  
+  return(colMeans(success_bonf))
+  
+}
+```
+
+```{r}
+compute_power_1d <- function(joint_cov, p_x, n = 100, 
+                             num_datasets = 100, 
+                             num_permutations = 100,
+                             alpha = 0.05) {
+  
+  success <- numeric(num_datasets)
+  
+  for (d in 1:num_datasets) {
+    
+    # Generate dataset
+    data <- generate_joint_data(joint_cov, n, p_x)
+    
+    # Observed canonical correlation (scalar)
+    r_obs <- cancor(data$X, data$Y)$cor[1]
+    
+    # Null distribution (vector)
+    r_null <- replicate(num_permutations, {
+      Y_perm <- data$Y[sample.int(n), , drop = FALSE]
+      cancor(data$X, Y_perm)$cor[1]
+    })
+    
+    # Permutation p-value
+    p_val <- (sum(r_null >= r_obs) + 1) / (num_permutations + 1)
+    
+    # Bonferroni not needed (k = 1)
+    if (p_val < alpha) success[d] <- 1
+  }
+  
+  mean(success)
+}
+```
+
+# Solve CCA
+```{r}
+solve_cca_dataset <- function(joint_cov, n = 100, p_x, k) {
+  
+  # Generate data
+  data <- generate_joint_data(joint_cov, n, p_x)
+  X <- data$X
+  Y <- data$Y
+  
+  # Compute CCA using cancor
+  cca_res <- cancor(X, Y)
+  
+  # Canonical weights
+  WX_hat_k <- cca_res$xcoef[, 1:k, drop = FALSE]
+  WY_hat_k <- cca_res$ycoef[, 1:k, drop = FALSE]
+  
+  # Canonical correlations
+  r_obs_all <- cca_res$cor[1:k]
+  
+  # Canonical scores
+  scores_X <- scale(X, center = TRUE, scale = FALSE) %*% WX_hat_k
+  scores_Y <- scale(Y, center = TRUE, scale = FALSE) %*% WY_hat_k
+  
+  list(
+    WX_hat = WX_hat_k,
+    WY_hat = WY_hat_k,
+    r_obs = r_obs_all,
+    scores_X = scores_X,
+    scores_Y = scores_Y,
+    joint_cov = joint_cov,
+    p_x = p_x,
+    n = n 
+  )
+}
+```
+
+# Relative Correlation Error
+```{r}
+relative_error <- function(r_est, r_true) {
+  
+  (r_est - r_true) / r_true
+}
+```
+
+# Cossim Similarity
+```{r}
+cos_similarity_k <- function(W_hat, W_true) {
+  
+  # Calculates cossim similarity for 2 weight matrices
+  
+  norm_hat <- sqrt(colSums(W_hat^2)) # Vector
+  norm_true <- sqrt(colSums(W_true^2))
+  
+  # Element wise multiplication and summing over cols
+  dot_products <- colSums(W_hat * W_true)
+
+  cos_theta <- dot_products / (norm_hat * norm_true) # Vector
+  
+  pmin(pmax(cos_theta, -1), 1)
+}
+```
+
+# Weight Error
+```{r}
+weight_error_k <- function(WX_hat, WY_hat, WX_true, WY_true) {
+  
+  # Compute 1 - |cos| for each dimension
+  err_X <- 1 - abs(cos_similarity_k(WX_hat, WX_true))
+  err_Y <- 1 - abs(cos_similarity_k(WY_hat, WY_true))
+  
+  # Parallel max
+  pmax(err_X, err_Y)
+}
+```
+
+# Score and Loading Error
+```{r}
+center_cols <- function(M) sweep(M, 2, colMeans(M), "-")
+```
+
+```{r}
+score_loading_error_k <- function(cca_fit, WX_true, WY_true) {
+
+  # Generate test data
+  test_data <- generate_joint_data(cca_fit$joint_cov, cca_fit$n, cca_fit$p_x)
+  
+  # Compute scores
+  sX_hat  <- test_data$X %*% cca_fit$WX_hat # n x k
+  sX_true <- test_data$X %*% WX_true
+  sY_hat  <- test_data$Y %*% cca_fit$WY_hat
+  sY_true <- test_data$Y %*% WY_true
+  
+  # Column center
+  sX_hat  <- center_cols(sX_hat)
+  sX_true <- center_cols(sX_true)
+  sY_hat  <- center_cols(sY_hat)
+  sY_true <- center_cols(sY_true)
+  
+  # Score error
+  err_score_X <- 1 - abs(cos_similarity_k(sX_hat, sX_true))
+  err_score_Y <- 1 - abs(cos_similarity_k(sY_hat, sY_true))
+  score_err   <- pmax(err_score_X, err_score_Y)
+  
+  # Compute loading error
+  compute_load_err <- function(X, s_hat, s_true) {
+    est_load  <- cor(X, s_hat) # p x k
+    true_load <- cor(X, s_true)
+    
+    est_load  <- center_cols(est_load)
+    true_load <- center_cols(true_load)
+    
+    1 - abs(cos_similarity_k(est_load, true_load))
+  }
+  
+  loading_err <- pmax(
+    compute_load_err(test_data$X, sX_hat, sX_true),
+    compute_load_err(test_data$Y, sY_hat, sY_true)
+  )
+  
+  list(score = score_err, loading = loading_err)
+}
+```
+
+# Figure 1
+```{r}
+# Parameters
+p_x <- 8; p_y <- 8
+r_true_list <- list(
+  "blue"  = c(0.55, 0.5, 0.45),  # Med
+  "green" = c(0.25, 0.2, 0.15)  # Low
+)
+n_per_ftr <- c(3, 4, 8, 16, 32, 64, 128, 256, 512, 1000) 
+n_reps_datasets <- 100 
+n_reps_models <- 10
+k_comp <- 3 # Num of canonical pairs
+
+if(!dir.exists("cca_sim_results")) dir.create("cca_sim_results")
+
+# Simulation
+for (r_color in names(r_true_list)) {
+  r_val <- r_true_list[[r_color]] # Get the correlation vector corresponding to r_color
+  message("\n--- Simulation for r_true [", r_color, "] = ", paste(r_val, collapse = ","), " ---")
+  
+  for (m in 1:n_reps_models) {
+    model_filename <- paste0("cca_sim_results/res_r", r_color, "_mod", m, ".rds")
+    
+    # Generate population model
+    model <- generate_cca_population(p_x = p_x, p_y = p_y, r_true = r_val)
+    joint_cov <- model$joint_cov
+    wX_true <- model$W_X
+    wY_true <- model$W_Y
+    
+    # Empty list to store metrics for all npf
+    model_results <- list()
+    
+    for (npf in n_per_ftr) {
+      current_n <- npf * p_x
+      
+      # Power
+      if (npf > 256) {
+        pow_res <- rep(1.0, k_comp)
+      } else {
+        pow_res <- compute_power(joint_cov, p_x = p_x, n = current_n,
+                                 num_datasets = n_reps_datasets, num_permutations = 100, k = k_comp)
+      }
+      
+      # Results of computing metrics 100 times
+      iter_metrics <- replicate(n_reps_datasets, {
+        res <- solve_cca_dataset(joint_cov, n = current_n, p_x = p_x, k = k_comp)
+        
+        w_err <- weight_error_k(res$WX_hat, res$WY_hat, wX_true, wY_true)
+        s_l_err <- score_loading_error_k(res, wX_true, wY_true)
+        
+        list(assoc = res$r_obs, w_err = w_err, s_err = s_l_err$score, l_err = s_l_err$loading)
+      }, simplify = FALSE) # Keep as list of lists
+      
+      # For each canonical pair take metric average and save results
+      for (comp in 1:k_comp) {
+        avg_assoc <- mean(sapply(iter_metrics, function(x) x$assoc[comp]))
+        avg_werr  <- mean(sapply(iter_metrics, function(x) x$w_err[comp]))
+        avg_serr  <- mean(sapply(iter_metrics, function(x) x$s_err[comp]))
+        avg_lerr  <- mean(sapply(iter_metrics, function(x) x$l_err[comp]))
+        
+        model_results[[length(model_results) + 1]] <- data.frame(
+          color = r_color,
+          r_true_val = r_val[comp],
+          component = comp,
+          n_per_ftr = npf,
+          model_id = m,
+          Power = pow_res[comp],
+          Association = avg_assoc,
+          Weight_Error = avg_werr,
+          Score_Error = avg_serr,
+          Loading_Error = avg_lerr
+        )
+      }
+    }
+    saveRDS(bind_rows(model_results), model_filename)
+    message("Saved Model ", m, " for ", r_color)
+  }
+}
+```
+
+```{r}
+# --- 1. Load and Prepare Data ---
+files <- list.files("cca_sim_results", full.names = TRUE)
+df_final <- map_dfr(files, readRDS)
+
+df_plot <- df_final %>%
+  pivot_longer(
+    cols = c(Power, Association, Weight_Error, Score_Error, Loading_Error),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  mutate(Metric = factor(Metric, 
+                         levels = c("Power", "Association", "Weight_Error", "Score_Error", "Loading_Error")))
+
+# --- 2. Fixed Panel Generator Function ---
+make_panel <- function(comp_idx, metric_name, show_y_axis = FALSE, panel_label = "") {
+  
+  sub_df <- df_plot %>% filter(component == comp_idx, Metric == metric_name)
+  
+  # Identify true values for the legend
+  r_blue  <- sub_df %>% filter(color == "blue") %>% pull(r_true_val) %>% first()
+  r_green <- sub_df %>% filter(color == "green") %>% pull(r_true_val) %>% first()
+  
+  p <- ggplot(sub_df, aes(x = n_per_ftr, y = Value, color = color, fill = color)) +
+    stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1), geom = "ribbon", alpha = 0.2, color = NA) +
+    stat_summary(fun = mean, geom = "line", size = 1.1) +
+    scale_color_manual(values = c("blue" = "#0000CD", "green" = "#00FF7F")) +
+    scale_fill_manual(values = c("blue" = "#0000CD", "green" = "#00FF7F")) +
+    # FIXED: Ticks every 100 up to 1000
+    scale_x_continuous(breaks = c(250, 500, 750, 1000)) +
+    theme_classic() +
+    theme(legend.position = "none", 
+          axis.title = element_blank(),
+          plot.title = element_text(hjust = -0.05, vjust = -1, size = 14, face = "plain")) +
+    labs(title = panel_label)
+  
+  # Association Row: Dashed lines and "true" labels
+  if (metric_name == "Association") {
+    p <- p + 
+      geom_hline(yintercept = r_blue, color = "#0000CD", linetype = "dashed", alpha = 0.5) +
+      geom_hline(yintercept = r_green, color = "#00FF7F", linetype = "dashed", alpha = 0.5) +
+      annotate("text", x = 60, y = r_blue - 0.04, label = "true", color = "#0000CD", size = 3.5) +
+      annotate("text", x = 60, y = r_green - 0.04, label = "true", color = "#00FF7F", size = 3.5) +
+      coord_cartesian(ylim = c(0, 0.8))
+  }
+  
+  # Power Row: FIXED LEGEND POSITIONing for the 1000 scale
+  if (metric_name == "Power") {
+    # Moved x to ~800 to sit in the white space of the converged lines
+    p <- p + 
+      annotate("text", x = 750, y = 0.42, label = "italic(r)[true] == phantom(0)", parse = TRUE, size = 4.5) +
+      annotate("text", x = 850, y = 0.35, label = sprintf("%.2f", r_blue), color = "#0000CD", size = 4.5, fontface = "bold") +
+      annotate("text", x = 850, y = 0.18, label = sprintf("%.2f", r_green), color = "#00FF7F", size = 4.5, fontface = "bold") +
+      coord_cartesian(ylim = c(0, 1.02))
+  }
+  
+  # Error Rows: Standardized Y-limits
+  if (metric_name %in% c("Weight_Error", "Score_Error", "Loading_Error")) {
+    p <- p + coord_cartesian(ylim = c(0, 1.02))
+  }
+  
+  # Hide Y axis for components 2 and 3
+  if (!show_y_axis) {
+    p <- p + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+  }
+  
+  return(p)
+}
+
+# --- 3. Building the Layout ---
+create_row_label <- function(text) {
+  wrap_elements(panel = textGrob(text, rot = 90, gp = gpar(fontsize = 12)))
+}
+
+# --- Column Labels ---
+col_labels <- lapply(c("Component 1", "Component 2", "Component 3"), function(lbl) {
+  ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = lbl, size = 5) +
+    theme_void()
+})
+
+# --- Row labels ---
+row_labels <- create_row_label("Power") / 
+              create_row_label("Association strength") / 
+              create_row_label("Weight error") / 
+              create_row_label("Score error") / 
+              create_row_label("Loading error")
+
+col1 <- (make_panel(1, "Power", T) / 
+         make_panel(1, "Association", T) / 
+         make_panel(1, "Weight_Error", T) / 
+         make_panel(1, "Score_Error", T) / 
+         make_panel(1, "Loading_Error", T))
+
+# Construct Column 2
+col2 <- (make_panel(2, "Power", F) / 
+         make_panel(2, "Association", F) / 
+         make_panel(2, "Weight_Error", F) / 
+         make_panel(2, "Score_Error", F) / 
+         make_panel(2, "Loading_Error", F))
+
+# Construct Column 3
+col3 <- (make_panel(3, "Power", F) / 
+         make_panel(3, "Association", F) / 
+         make_panel(3, "Weight_Error", F) / 
+         make_panel(3, "Score_Error", F) / 
+         make_panel(3, "Loading_Error", F))
+
+row_labels <- wrap_elements(
+  create_row_label("Power") / 
+  create_row_label("Association strength") / 
+  create_row_label("Weight error") / 
+  create_row_label("Score error") / 
+  create_row_label("Loading error")
+)
+
+final_plot <- wrap_plots(
+  # Top row
+  plot_spacer(), col_labels[[1]], col_labels[[2]], col_labels[[3]],
+  # Bottom row
+  row_labels, col1, col2, col3,
+  ncol = 4,
+  heights = c(0.015, 1),  # smaller top row
+  widths = c(0.16, 1, 1, 1)
+) +
+  plot_annotation(
+    caption = "Samples per feature",
+    theme = theme(plot.caption = element_text(hjust = 0.5, size = 12))
+  )
+
+# --- 4. Export ---
+ggsave("Fig1_3D.pdf", final_plot, width = 10, height = 14)
+```
+
+# Figure 1 (1 Component)
+```{r}
+# Parameters
+p_x <- 8; p_y <- 8
+r_true_list <- list(
+  "blue"  = c(0.5),
+  "green" = c(0.1)
+)
+n_per_ftr <- c(3, 4, 8, 16, 32, 64, 128, 256, 300) 
+n_reps_datasets <- 100 
+n_reps_models <- 10
+k_comp <- 1
+
+if(!dir.exists("cca_sim_results_1d")) dir.create("cca_sim_results_1d")
+
+# Simulation
+for (r_color in names(r_true_list)) {
+  r_val <- r_true_list[[r_color]] # Get the correlation vector corresponding to r_color
+  message("\n--- Simulation for r_true [", r_color, "] = ", paste(r_val, collapse = ","), " ---")
+  
+  for (m in 1:n_reps_models) {
+    model_filename <- paste0("cca_sim_results_1d/res_r", r_color, "_mod", m, ".rds")
+    
+    # Generate population model
+    model <- generate_cca_population(p_x = p_x, p_y = p_y, r_true = r_val)
+    joint_cov <- model$joint_cov
+    wX_true <- model$W_X
+    wY_true <- model$W_Y
+    
+    # Empty list to store metrics for all npf
+    model_results <- list()
+    
+    for (npf in n_per_ftr) {
+      current_n <- npf * p_x
+      
+      # Power
+      pow_res <- compute_power_1d(joint_cov, p_x = p_x, n = current_n, 
+                                  num_datasets = n_reps_datasets, num_permutations = 100)
+      
+      # Results of computing metrics 100 times
+      iter_metrics <- replicate(n_reps_datasets, {
+        res <- solve_cca_dataset(joint_cov, n = current_n, p_x = p_x, k = k_comp)
+        
+        w_err <- weight_error_k(res$WX_hat, res$WY_hat, wX_true, wY_true)
+        s_l_err <- score_loading_error_k(res, wX_true, wY_true)
+        
+        list(assoc = res$r_obs, w_err = w_err, s_err = s_l_err$score, l_err = s_l_err$loading)
+      }, simplify = FALSE) # Keep as list of lists
+      
+      avg_assoc <- mean(sapply(iter_metrics, function(x) x$assoc[1]))
+      avg_werr  <- mean(sapply(iter_metrics, function(x) x$w_err[1]))
+      avg_serr  <- mean(sapply(iter_metrics, function(x) x$s_err[1]))
+      avg_lerr  <- mean(sapply(iter_metrics, function(x) x$l_err[1]))
+        
+      model_results[[length(model_results) + 1]] <- data.frame(
+        color = r_color,
+        r_true_val = r_val[1],
+        component = 1,
+        n_per_ftr = npf,
+        model_id = m,
+        Power = pow_res,
+        Association = avg_assoc,
+        Weight_Error = avg_werr,
+        Score_Error = avg_serr,
+        Loading_Error = avg_lerr
+      )
+    }
+    saveRDS(bind_rows(model_results), model_filename)
+    message("Saved Model ", m, " for ", r_color)
+  }
+}
+```
+```{r}
+# --- 1. Load Data ---
+full_df <- list.files("cca_sim_results_1d", pattern = "*.rds", full.names = TRUE) %>% 
+  map_df(readRDS)
+
+# --- 2. Process Data ---
+plot_df <- full_df %>%
+  pivot_longer(cols = c(Power, Association, Weight_Error, Score_Error, Loading_Error), 
+               names_to = "Metric", values_to = "Value") %>%
+  group_by(color, r_true_val, n_per_ftr, Metric) %>%
+  summarise(
+    mean_v = mean(Value, na.rm=TRUE),
+    low_v = quantile(Value, 0.025, na.rm=TRUE),
+    high_v = quantile(Value, 0.975, na.rm=TRUE),
+    .groups = 'drop'
+  )
+
+# --- 3. Plot Function ---
+make_p <- function(metric_name, title_y, show_x = FALSE, show_legend = FALSE) {
+  paper_colors <- c("blue" = "#0000CD", "green" = "#00FF7F")
+  paper_labels <- c("blue" = "0.5", "green" = "0.1")  # <-- legend labels
+  
+  p <- ggplot(plot_df %>% filter(Metric == metric_name), 
+              aes(x = n_per_ftr, y = mean_v, color = color, fill = color)) +
+    geom_ribbon(aes(ymin = low_v, ymax = high_v), alpha = 0.3, color = NA) +
+    geom_line(size = 1.1) +
+    scale_color_manual(values = paper_colors, labels = paper_labels, name = expression(r[true])) +
+    scale_fill_manual(values = paper_colors, labels = paper_labels, name = expression(r[true])) +
+    theme_classic(base_size = 11) +
+    labs(y = title_y, x = if(show_x) "Samples per feature" else NULL) +
+    theme(
+      aspect.ratio = 1,
+      axis.text.x = if(show_x) element_text(color = "black") else element_blank(),
+      axis.ticks.x = if(show_x) element_line() else element_blank(),
+      axis.line = element_line(size = 0.6),
+      plot.margin = margin(t = 2, r = 10, b = 2, l = 10)
+    )
+  
+  if(show_legend) {
+    p <- p + theme(legend.position = c(0.8, 0.2), legend.background = element_blank())
+  } else {
+    p <- p + theme(legend.position = "none")
+  }
+  
+  return(p)
+}
+
+# --- 4. Build Panels ---
+p1 <- make_p("Power", "Power", show_legend = TRUE)
+p2 <- make_p("Association", "Association strength") + 
+      geom_hline(yintercept = 0.5, color = "#0000CD", linetype = "dashed", alpha = 0.4) +
+      geom_hline(yintercept = 0.1, color = "#00FF7F", linetype = "dashed", alpha = 0.4)
+p3 <- make_p("Weight_Error", "Weight error")
+p4 <- make_p("Score_Error", "Score error")
+p5 <- make_p("Loading_Error", "Loading error", show_x = TRUE)
+
+# --- 5. Final Layout ---
+final_plot <- (p1 / p2 / p3 / p4 / p5) + plot_layout(guides = 'collect')
+
+# --- 6. Save ---
+ggsave("Fig1_1D.pdf", final_plot, width = 4, height = 15)
+```
+
+# Figure 2
+```{r}
+# --- PARAMETERS ---
+n_rep_obs <- 100
+n_per_ftr_vec <- c(3, 8, 16, 32, 64, 128, 256, 512, 1000)
+
+r_true_vec_list <- list(
+  c(0.25, 0.2, 0.15),
+  c(0.55, 0.5, 0.45),
+  c(0.8, 0.75, 0.7)
+)
+
+n_sigmas <- 15
+ax_ay_val <- -1.0
+px_vals_eq <- c(4, 8, 16, 32)
+n_cores <- 8
+k_comp <- 3
+
+if (!dir.exists("cca_multi_px_results")) dir.create("cca_multi_px_results")
+
+# Creates function
+run_stability_batch <- function(px, py, cond_name, r_true) {
+  
+  k <- length(r_true)
+  
+  # Updates user on current status
+  cat(sprintf("\n--- Condition: %s (px=%d, py=%d) r_true=%s ---\n",
+              cond_name, px, py, paste(round(r_true, 2), collapse = ",")))
+  
+  for (mod in 1:n_sigmas) {
+    
+    file_path <- sprintf("cca_multi_px_results/%s_px%d_r%s_mod%d.rds",
+                         cond_name, px,
+                         paste(round(r_true, 2), collapse = "-"),
+                         mod)
+    
+    if (file.exists(file_path)) next
+    
+    # Generate population
+    model <- generate_cca_population(c_x = 1, c_y = 1, a_x = ax_ay_val, 
+                                     a_y = ax_ay_val, p_x = px, p_y = py,
+                                     r_true = r_true)
+    
+    # Loops over sample size (n_per_ftr_vec)
+    batch_results <- map_df(n_per_ftr_vec, function(n_ptf) {
+      
+      n_total <- ceiling(n_ptf * px)
+      
+      # Power
+      if (n_ptf > 256) {
+        p_bonf_val <- rep(1.0, k)
+      } else {
+        p_bonf_val <- compute_power(joint_cov = model$joint_cov, p_x = px,
+          n = n_total, num_datasets = n_rep_obs, num_permutations = 100,
+          k = k)
+      }
+      
+      # Computes error metric n_rep_obs times
+      # For each replication produce df with k rows
+      draws <- replicate(n_rep_obs, {
+        
+        cca_fit <- solve_cca_dataset(joint_cov = model$joint_cov,
+          n = n_total, p_x = px, k = k)
+        
+        rel_assoc_err <- relative_error(cca_fit$r_obs, r_true)
+        weight_err <- weight_error_k(cca_fit$WX_hat, cca_fit$WY_hat,
+          model$W_X, model$W_Y)
+        score_load <- score_loading_error_k(cca_fit, model$W_X, model$W_Y)
+        
+        data.frame(
+          Canonical_Pair = 1:k,
+          Rel_Assoc_Err  = rel_assoc_err,
+          Weight_Err     = weight_err,
+          Score_Err      = score_load$score,
+          Load_Err       = score_load$loading
+        )
+        
+      }, simplify = FALSE)
+      
+      # Average across datasets for same canonical pair
+      draws_df <- bind_rows(draws) %>%
+        group_by(Canonical_Pair) %>%
+        summarise(
+          Rel_Assoc_Err = mean(Rel_Assoc_Err),
+          Weight_Err    = mean(Weight_Err),
+          Score_Err     = mean(Score_Err),
+          Load_Err      = mean(Load_Err),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          Power_Bonf = p_bonf_val,
+          n_per_ftr  = n_ptf
+        )
+      
+      draws_df
+    })
+    
+    # --- Save results ---
+    saveRDS(
+      batch_results %>%
+        mutate(
+          px = px,
+          py = py,
+          r_true = paste(round(r_true, 2), collapse = "-"),
+          mod = mod,
+          cond = cond_name
+        ),
+      file_path
+    )
+    
+    cat(sprintf("Saved mod %d\n", mod))
+  }
+}
+
+# Parallel Processing
+all_tasks <- expand.grid(
+  px = px_vals_eq,
+  r_idx = seq_along(r_true_vec_list)
+) %>%
+  mutate(
+    py = px,
+    cond = "px_eq_py"
+  )
+
+mclapply(1:nrow(all_tasks), function(i) {
+  
+  task <- all_tasks[i, ]
+  
+  run_stability_batch(
+    px = task$px,
+    py = task$py,
+    cond_name = task$cond,
+    r_true = r_true_vec_list[[task$r_idx]]
+  )
+  
+}, mc.cores = n_cores)
+```
+
+```{r}
+# --- 1. Colors ---
+color_map_raw <- c(
+  "0.15" = "#00FF7F", "0.20" = "#00FF7F", "0.25" = "#00FF7F",
+  "0.45" = "#008B8B", "0.50" = "#008B8B", "0.55" = "#008B8B",
+  "0.70" = "#0000CD", "0.75" = "#0000CD", "0.80" = "#0000CD"
+)
+
+r_values_ref <- data.frame(
+  Canonical_Pair = rep(1:3, each = 3),
+  Value_Ref = c(0.25, 0.55, 0.80,
+                0.20, 0.50, 0.75,
+                0.15, 0.45, 0.70)
+) %>%
+  mutate(Value_Str = sprintf("%.2f", Value_Ref))
+
+# --- 2. Data ---
+files <- list.files("cca_multi_px_results", pattern = "\\.rds$", full.names = TRUE)
+if(length(files) == 0) stop("No RDS files found!")
+
+df_raw <- map_df(files, readRDS)
+
+df_plot <- df_raw %>%
+  pivot_longer(
+    cols = any_of(c("Power_Bonf", "Rel_Assoc_Err", "Weight_Err", "Score_Err", "Load_Err")),
+    names_to = "Metric", values_to = "Value"
+  ) %>%
+  mutate(
+    r_list = str_split(r_true, "-"),
+    val_to_map = map2_dbl(r_list, Canonical_Pair, ~ as.numeric(.x[.y])),
+    val_str = sprintf("%.2f", val_to_map),
+
+    px = factor(px, levels = c(4, 8, 16, 32)),
+
+    Metric = factor(Metric,
+      levels = c("Power_Bonf", "Rel_Assoc_Err", "Weight_Err", "Score_Err", "Load_Err"),
+      labels = c("Power", "Relative association\nstrength error", "Weight error", "Score error", "Loading error")
+    ),
+
+    Value = pmax(Value, 1e-4)
+  )
+
+# --- 3. Panel Function ---
+make_per_pair_panel <- function(df_data, comp_idx, metric_name,
+                                show_y_axis = FALSE,
+                                show_linetype_legend = FALSE) {
+
+  sub_df <- df_data %>% filter(Canonical_Pair == comp_idx, Metric == metric_name)
+  if(nrow(sub_df) == 0) return(ggplot() + theme_void())
+
+  legend_vals <- r_values_ref %>%
+    filter(Canonical_Pair == comp_idx) %>%
+    pull(Value_Str)
+
+  p <- ggplot(sub_df, aes(x = n_per_ftr, y = Value,
+                        color = val_str, linetype = factor(px))) +  # wrap px in factor
+    stat_summary(fun = mean, geom = "line", linewidth = 0.8)
+
+  p <- p + scale_linetype_manual(
+    name = "px",  # <-- sets the legend title
+    values = c("4"="dotdash", "8"="dashed", "16"="longdash", "32"="solid"),
+    guide = if(show_linetype_legend) "legend" else "none"
+  )
+
+  # Correlation legend ONLY for Power row
+  if (metric_name == "Power") {
+    p <- p + annotation_custom(
+      grob = tableGrob(
+        d = data.frame(r = legend_vals),
+        theme = ttheme_minimal(
+          base_size = 8,
+          core = list(
+            fg_params = list(
+              fontface = "bold",
+              col = color_map_raw[legend_vals],
+              hjust = 0, x = 0.1
+            ),
+            bg_params = list(fill = NA)
+          ),
+          rowhead = list(
+            fg_params = list(hjust = 0, x = 0, fontface = "italic")
+          )
+        ),
+        rows = c(expression(r[true] == ""), "", ""),
+        cols = NULL
+      ),
+      xmin = 20, xmax = 400,
+      ymin = 0.02, ymax = 0.3
+    )
+  }
+
+  p <- p +
+    scale_x_log10(
+      limits = c(3, 1100),
+      breaks = c(10, 100, 1000),
+      labels = expression(10^1, 10^2, 10^3)
+    ) +
+    scale_y_log10(
+      limits = c(1e-3, 1.2),
+      breaks = c(1e-3, 1e-2, 1e-1, 1),
+      labels = expression(10^-3, 10^-2, 10^-1, 10^0)
+    ) +
+
+    scale_color_manual(values = color_map_raw, guide = "none") +
+
+    scale_linetype_manual(
+      name = expression(px),
+      values = c("4"="dotdash", "8"="dashed", "16"="longdash", "32"="solid"),
+      guide = if (show_linetype_legend) "legend" else "none"
+    ) +
+
+    theme_classic() +
+    theme(
+      legend.position = if (show_linetype_legend) "bottom" else "none",
+      axis.title = element_blank(),
+      axis.text = element_text(size = 9, color = "black"),
+      plot.margin = margin(2, 2, 2, 2)
+    )
+
+  if (!show_y_axis) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.y = element_blank()
+    )
+  }
+
+  return(p)
+}
+
+# --- 4. Build Panels ---
+metrics_levels <- levels(df_plot$Metric)
+panel_list <- list()
+
+for (r_idx in seq_along(metrics_levels)) {
+  for (c_idx in 1:3) {
+
+    show_legend <- (r_idx == 1 && c_idx == 1)  # ONLY ONE legend source
+
+    name <- paste0("panel_", r_idx, "_", c_idx)
+
+    panel_list[[name]] <- make_per_pair_panel(
+      df_plot,
+      c_idx,
+      metrics_levels[r_idx],
+      show_y_axis = (c_idx == 1),
+      show_linetype_legend = show_legend
+    )
+  }
+}
+
+# --- 1. Column Labels ---
+col_labels <- lapply(c("Component 1", "Component 2", "Component 3"), function(lbl) {
+  ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = lbl, size = 5,) +
+    theme_void()
+})
+
+# --- 2. Row Labels Function ---
+make_row_label <- function(text) {
+  wrap_elements(textGrob(text, rot = 90, gp = gpar(fontsize = 10, fontface = "bold")))
+}
+
+row_labels_list <- list(
+  make_row_label("Power"),
+  make_row_label("Relative association\nstrength error"),
+  make_row_label("Weight error"),
+  make_row_label("Score error"),
+  make_row_label("Loading error")
+)
+row_labels_plots <- wrap_plots(row_labels_list, ncol = 1)
+
+# --- 3. Columns: panels ---
+# Ensure each panel has legend suppressed except one panel (e.g., first Power panel)
+# Example: when creating panel_list, do show_linetype_legend = TRUE only once
+
+col1_combined <- c1
+col2_combined <- c2
+col3_combined <- c3
+
+# --- 4. Final Layout ---
+final_plot_with_cols <- wrap_plots(
+  # Top row: spacer + column headers
+  plot_spacer(), col_labels[[1]], col_labels[[2]], col_labels[[3]],
+  # Main panels: row labels + columns
+  row_labels_plots, col1_combined, col2_combined, col3_combined,
+  ncol = 4,
+  heights = c(0.02, 1),
+  widths = c(0.12, 1, 1, 1),
+  guides = "collect"   # <-- collect all legends into a single global legend
+) +
+  plot_annotation(
+    caption = "Samples per feature",
+    theme = theme(plot.caption = element_text(hjust = 0.5, size = 12))
+  ) &
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal"
+  ) &
+  labs(linetype = "px")
+
+# --- 5. Save ---
+ggsave("Fig2_3D.pdf", final_plot_with_cols, width = 11, height = 15)
+```
+
+# Figure 2 (1 Component)
+```{r}
+# --- PARAMETERS ---
+n_rep_obs <- 100
+n_per_ftr_vec <- c(3, 8, 16, 32, 64, 128, 256, 512, 1000)
+
+r_true_vec_list <- list(
+  c(0.1),
+  c(0.3),
+  c(0.7)
+)
+
+n_sigmas <- 10
+ax_ay_val <- -1.0
+px_vals_eq <- c(4, 8, 16, 32)
+n_cores <- 8
+k_comp <- 1
+
+if (!dir.exists("cca_multi_px_1d_results")) dir.create("cca_multi_px_1d_results")
+
+# Creates function
+run_stability_batch <- function(px, py, cond_name, r_true) {
+  
+  
+  # Updates user on current status
+  cat(sprintf("\n--- Condition: %s (px=%d, py=%d) r_true=%s ---\n",
+              cond_name, px, py, paste(round(r_true, 2), collapse = ",")))
+  
+  for (mod in 1:n_sigmas) {
+    
+    file_path <- sprintf("cca_multi_px_1d_results/%s_px%d_r%s_mod%d.rds",
+                         cond_name, px,
+                         paste(round(r_true, 2), collapse = "-"),
+                         mod)
+    
+    if (file.exists(file_path)) next
+    
+    # Generate population
+    model <- generate_cca_population(c_x = 1, c_y = 1, a_x = ax_ay_val, 
+                                     a_y = ax_ay_val, p_x = px, p_y = py,
+                                     r_true = r_true)
+    
+    # Loops over sample size (n_per_ftr_vec)
+    batch_results <- map_df(n_per_ftr_vec, function(n_ptf) {
+      
+      n_total <- ceiling(n_ptf * px)
+      
+      # Power
+      if (n_ptf > 256) {
+        p_val <- 1.0
+      } else {
+        p_val <- compute_power_1d(joint_cov = model$joint_cov, p_x = px,
+          n = n_total, num_datasets = n_rep_obs, num_permutations = 100)
+      }
+      
+      # Computes error metric n_rep_obs times
+      draws <- replicate(n_rep_obs, {
+        
+        cca_fit <- solve_cca_dataset(joint_cov = model$joint_cov,
+          n = n_total, p_x = px, k = k_comp)
+        
+        sl_err <- score_loading_error_k(cca_fit, model$W_X, model$W_Y)
+        
+        data.frame(
+          Canonical_Pair = 1,  # always 1
+          Rel_Assoc_Err  = relative_error(cca_fit$r_obs, r_true),
+          Weight_Err     = weight_error_k(cca_fit$WX_hat, cca_fit$WY_hat, model$W_X,
+                                          model$W_Y),
+          Score_Err = sl_err$score,
+          Load_Err  = sl_err$loading
+          )
+      }, simplify = FALSE)
+      
+      # Average across datasets for same canonical pair
+      draws_df <- bind_rows(draws) %>%
+        summarise(
+          Rel_Assoc_Err = mean(Rel_Assoc_Err),
+          Weight_Err    = mean(Weight_Err),
+          Score_Err     = mean(Score_Err),
+          Load_Err      = mean(Load_Err),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          Power_Bonf = p_val,
+          n_per_ftr  = n_ptf
+        )
+      
+      draws_df
+    })
+    
+    # --- Save results ---
+    saveRDS(
+      batch_results %>%
+        mutate(
+          px = px,
+          py = py,
+          r_true = paste(round(r_true, 2), collapse = "-"),
+          mod = mod,
+          cond = cond_name
+        ),
+      file_path
+    )
+    
+    cat(sprintf("Saved mod %d\n", mod))
+  }
+}
+
+# Parallel Processing
+all_tasks <- expand.grid(
+  px = px_vals_eq,
+  r_idx = seq_along(r_true_vec_list)
+) %>%
+  mutate(
+    py = px,
+    cond = "px_eq_py"
+  )
+
+mclapply(1:nrow(all_tasks), function(i) {
+  
+  task <- all_tasks[i, ]
+  
+  run_stability_batch(
+    px = task$px,
+    py = task$py,
+    cond_name = task$cond,
+    r_true = r_true_vec_list[[task$r_idx]]
+  )
+  
+}, mc.cores = n_cores)
+```
+
+```{r}
+# --- 1. Load Data ---
+files <- list.files("cca_multi_px_1d_results", pattern = "\\.rds$", full.names = TRUE)
+if(length(files) == 0) stop("No RDS files found!")
+df_raw <- map_df(files, readRDS)
+
+# --- 2. Prepare Data for Plotting ---
+df_plot <- df_raw %>%
+  pivot_longer(
+    cols = any_of(c("Power_Bonf", "Rel_Assoc_Err", "Weight_Err", "Score_Err", "Load_Err")),
+    names_to = "Metric", values_to = "Value"
+  ) %>%
+  mutate(
+    r_true = sprintf("%.2f", as.numeric(r_true)),  # color mapping
+    px = factor(px, levels = c(4, 8, 16, 32)),
+    Metric = factor(Metric,
+      levels = c("Power_Bonf", "Rel_Assoc_Err", "Weight_Err", "Score_Err", "Load_Err"),
+      labels = c("Power", "Relative assocciation error", "Weight error", "Score error", "Loading error")
+    ),
+    Value = pmax(Value, 1e-4)  # prevent log(0)
+  )
+
+# --- 3. Define Colors and Linetypes ---
+color_map <- c("0.10" = "#96F3A6", "0.30" = "#45ADA8", "0.70" = "#00008B")
+line_map <- c("4" = "dotdash", "8" = "dashed", "16" = "longdash", "32" = "solid")
+
+# --- 4. Plotting Function ---
+make_1d_plot <- function(df, metric_name, show_x = FALSE) {
+  
+  p <- df %>% filter(Metric == metric_name) %>%
+    ggplot(aes(x = n_per_ftr, y = Value,
+               color = r_true,
+               linetype = px,
+               group = interaction(r_true, px))) +
+    stat_summary(fun = mean, geom = "line", linewidth = 0.8) +
+    scale_color_manual(values = color_map) +
+    scale_linetype_manual(values = line_map) +
+    scale_x_log10(
+      breaks = c(10, 100, 1000),
+      labels = scales::trans_format("log10", scales::math_format(10^.x))
+    ) +
+    scale_y_log10(
+      limits = c(1e-3, 1.2),
+      breaks = c(1e-3, 1e-2, 1e-1, 1),
+      labels = scales::trans_format("log10", scales::math_format(10^.x))
+    ) +
+    theme_classic(base_size = 12) +
+    labs(y = NULL, x = if(show_x) "Samples per feature" else NULL) +
+    theme(
+      legend.position = "bottom",
+      axis.text = element_text(color = "black"),
+      axis.ticks = element_line(color = "black")
+    )
+  
+  return(p)
+}
+
+# --- 5. Create Row Plots ---
+row_plots <- map(levels(df_plot$Metric), ~ make_1d_plot(df_plot, .x, show_x = (.x == "Loading error")))
+
+# --- 6. Add Row Labels ---
+make_row_label <- function(text) {
+  wrap_elements(textGrob(text, rot = 90, gp = gpar(fontsize = 10, fontface = "bold")))
+}
+row_labels <- map(levels(df_plot$Metric), make_row_label)
+row_labels_plots <- wrap_plots(row_labels, ncol = 1)
+
+# --- 7. Assemble Final Plot (Single Column) ---
+final_plot <- wrap_plots(
+  row_labels_plots, wrap_plots(row_plots, ncol = 1),
+  ncol = 2,
+  widths = c(0.12, 1),
+  guides = "collect"
+) &
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal"
+  )
+
+# --- 8. Save ---
+ggsave("Fig2_1D.pdf", final_plot, width = 6, height = 15)
+```
+
+# Figure 3
+```{r}
+plan(multisession, workers = 8)
+options(future.globals.maxSize = 8 * 1024^3)
+
+results_dir <- "cca_px_plus_py_64_results"
+if (!dir.exists(results_dir)) dir.create(results_dir)
+
+# ==========================================
+# 1. CORE BATCH FUNCTION
+# ==========================================
+run_stability_batch <- function(px, py, cond_name, r_true, n_rep_obs, n_sigmas, n_per_ftr_vec) {
+  k <- length(r_true)
+  message(sprintf("\n>>> STARTING: px=%d, py=%d (sum=%d)", px, py, px + py))
+
+  for (mod in 1:n_sigmas) {
+    file_path <- sprintf(
+      "%s/%s_px%d_py%d_r%s_mod%d.rds",
+      results_dir, cond_name, px, py,
+      paste(round(r_true, 2), collapse = "-"), mod
+    )
+    if (file.exists(file_path)) next
+
+    model <- generate_cca_population(p_x = px, p_y = py, r_true = r_true)
+
+    batch_results <- purrr::map_df(n_per_ftr_vec, function(n_ptf) {
+      n_total <- ceiling(n_ptf * px)
+
+      # Skip unstable case
+      if (n_total <= max(px, py)) {
+        return(data.frame(
+          Canonical_Pair = 1:k,
+          Power_Raw = NA,
+          Rel_Assoc_Err = NA,
+          Weight_Err = NA,
+          Score_Err = NA,
+          Load_Err = NA,
+          n_per_ftr = n_ptf
+        ))
+      }
+
+      # Compute power
+      p_raw <- if (n_ptf > 256) rep(1.0, k) else compute_power(
+        joint_cov = model$joint_cov,
+        p_x = px, n = n_total,
+        num_datasets = n_rep_obs,
+        num_permutations = 100,
+        k = k
+      )
+
+      # Replicate for error metrics
+      draws <- replicate(n_rep_obs, {
+        tryCatch({
+          cca_fit <- solve_cca_dataset(model$joint_cov, n_total, px, k)
+          if (is.null(cca_fit)) return(NULL)
+          rel_err <- relative_error(cca_fit$r_obs, r_true)
+          weight_err <- weight_error_k(cca_fit$WX_hat, cca_fit$WY_hat, model$W_X, model$W_Y)
+          score_load <- score_loading_error_k(cca_fit, model$W_X, model$W_Y)
+          data.frame(
+            Canonical_Pair = 1:k,
+            Rel_Assoc_Err = rel_err,
+            Weight_Err = weight_err,
+            Score_Err = score_load$score,
+            Load_Err = score_load$loading
+          )
+        }, error = function(e) NULL)
+      }, simplify = FALSE)
+
+      draws <- draws[!sapply(draws, is.null)]
+      if (length(draws) == 0) {
+        return(data.frame(
+          Canonical_Pair = 1:k,
+          Power_Raw = NA,
+          Rel_Assoc_Err = NA,
+          Weight_Err = NA,
+          Score_Err = NA,
+          Load_Err = NA,
+          n_per_ftr = n_ptf
+        ))
+      }
+
+      dplyr::bind_rows(draws) %>%
+        dplyr::group_by(Canonical_Pair) %>%
+        dplyr::summarise(dplyr::across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+        dplyr::mutate(Power_Raw = p_raw, n_per_ftr = n_ptf)
+    })
+
+    saveRDS(
+      batch_results %>% dplyr::mutate(px = px, py = py, mod = mod, r_true_label = paste(round(r_true, 2), collapse = "-"), cond = cond_name),
+      file_path
+    )
+    cat(sprintf("   Saved mod %d/%d (px=%d, py=%d)\n", mod, n_sigmas, px, py))
+  }
+}
+
+# ==========================================
+# 2. TASK GRID
+# ==========================================
+n_rep_obs <- 100
+n_per_ftr_vec <- c(3, 8, 16, 32, 64, 128, 256, 512, 1000)
+r_true_vec_list <- list(c(0.25,0.2,0.15), c(0.55,0.5,0.45), c(0.8,0.75,0.7))
+n_sigmas <- 15
+px_vals <- c(4, 8, 16)
+
+all_tasks <- expand.grid(px = px_vals, r_idx = seq_along(r_true_vec_list))
+all_tasks$py <- 64 - all_tasks$px
+all_tasks$cond <- "px_plus_py_64"
+
+# ==========================================
+# 3. PARALLEL EXECUTION
+# ==========================================
+results <- future_lapply(1:nrow(all_tasks), function(i) {
+  task <- all_tasks[i, ]
+  cat(sprintf("\n[Task %d/%d] px=%d, py=%d\n", i, nrow(all_tasks), task$px, task$py))
+  tryCatch({
+    run_stability_batch(
+      px = task$px, py = task$py, cond_name = task$cond,
+      r_true = r_true_vec_list[[task$r_idx]],
+      n_rep_obs = n_rep_obs, n_sigmas = n_sigmas, n_per_ftr_vec = n_per_ftr_vec
+    )
+    "OK"
+  }, error = function(e) {
+    msg <- sprintf("FAILED: px=%d py=%d | %s", task$px, task$py, e$message)
+    cat(msg, "\n")
+    msg
+  })
+}, future.seed = TRUE)
+```
+
+```{r}
+# ==========================================
+# 1. COLORS & REFERENCE DATA
+# ==========================================
+color_map_raw <- c(
+  "0.15" = "#00FF7F", "0.20" = "#00FF7F", "0.25" = "#00FF7F",
+  "0.45" = "#008B8B", "0.50" = "#008B8B", "0.55" = "#008B8B",
+  "0.70" = "#0000CD", "0.75" = "#0000CD", "0.80" = "#0000CD"
+)
+
+r_values_ref <- data.frame(
+  Canonical_Pair = rep(1:3, each = 3),
+  Value_Ref = c(0.25, 0.55, 0.80,
+                0.20, 0.50, 0.75,
+                0.15, 0.45, 0.70)
+) %>%
+  mutate(Value_Str = sprintf("%.2f", Value_Ref))
+
+# ==========================================
+# 2. DATA LOADING & PREP
+# ==========================================
+results_dir_64 <- "cca_px_plus_py_64_results"
+results_dir_bal <- "cca_multi_px_results" 
+
+files_64  <- list.files(results_dir_64, pattern = "\\.rds$", full.names = TRUE)
+files_32  <- list.files(results_dir_bal, pattern = "px32.*\\.rds$", full.names = TRUE)
+all_files <- c(files_64, files_32)
+
+if(length(all_files) == 0) stop("No RDS files found! Check your directory paths.")
+
+df_raw <- map_df(all_files, function(f) {
+  data <- readRDS(f)
+  
+  # Check if this is the px=32 file (which uses Power_Bonf)
+  # and rename it to Power_Raw so it matches the other files
+  if ("Power_Bonf" %in% colnames(data)) {
+    data <- data %>% rename(Power_Raw = Power_Bonf)
+  }
+  
+  return(data)
+})
+
+df_plot <- df_raw %>%
+  mutate(r_label = coalesce(as.character(r_true_label), as.character(r_true))) %>%
+  pivot_longer(
+    cols = any_of(c("Power_Raw", "Rel_Assoc_Err", "Weight_Err", "Score_Err", "Load_Err")),
+    names_to = "Metric", values_to = "Value"
+  ) %>%
+  mutate(
+    r_list = str_split(r_label, "-"),
+    val_to_map = map2_dbl(r_list, Canonical_Pair, ~ as.numeric(.x[.y])),
+    val_str = sprintf("%.2f", val_to_map),
+    
+    # Levels include the new px=16
+    px_f = factor(px, levels = c(4, 8, 16, 32)),
+
+    Metric = factor(Metric,
+      levels = c("Power_Raw", "Rel_Assoc_Err", "Weight_Err", "Score_Err", "Load_Err"),
+      labels = c("Power", "Relative association\nstrength error", "Weight error", "Score error", "Loading error")
+    ),
+    Value = pmax(Value, 1e-4)
+  )
+
+# ==========================================
+# 3. PANEL FUNCTION (Legend Shifted Right)
+# ==========================================
+make_per_pair_panel <- function(df_data, comp_idx, metric_name,
+                                show_y_axis = FALSE,
+                                show_linetype_legend = FALSE) {
+
+  sub_df <- df_data %>% filter(Canonical_Pair == comp_idx, Metric == metric_name)
+  if(nrow(sub_df) == 0) return(ggplot() + theme_void())
+
+  legend_vals <- r_values_ref %>%
+    filter(Canonical_Pair == comp_idx) %>%
+    pull(Value_Str)
+
+  p <- ggplot(sub_df, aes(x = n_per_ftr, y = Value,
+                          color = val_str, linetype = px_f)) +
+    stat_summary(fun = mean, geom = "line", linewidth = 0.8)
+
+  if (metric_name == "Power") {
+    p <- p + annotation_custom(
+      grob = tableGrob(
+        d = data.frame(r = legend_vals),
+        theme = ttheme_minimal(
+          base_size = 8,
+          core = list(
+            fg_params = list(fontface = "bold", col = color_map_raw[legend_vals], hjust = 0, x = 0.1),
+            bg_params = list(fill = NA)
+          ),
+          rowhead = list(fg_params = list(hjust = 0, x = 0, fontface = "italic"))
+        ),
+        rows = c(expression(r[true] == ""), "", ""),
+        cols = NULL
+      ),
+      # CHANGED: xmin from 20 to 100, xmax from 400 to 800 to shift right
+      xmin = 100, xmax = 800, ymin = 0.02, ymax = 0.3
+    )
+  }
+
+  p <- p +
+    scale_x_log10(limits = c(3, 1100), breaks = c(10, 100, 1000), labels = expression(10^1, 10^2, 10^3)) +
+    scale_y_log10(limits = c(1e-3, 1.2), breaks = c(1e-3, 1e-2, 1e-1, 1), labels = expression(10^-3, 10^-2, 10^-1, 10^0)) +
+    scale_color_manual(values = color_map_raw, guide = "none") +
+    scale_linetype_manual(
+      values = c("4" = "dotted", "8" = "dotdash", "16" = "dashed", "32" = "solid"),
+      labels = c("4" = "4", "8" = "8", "16" = "16", "32" = "32"),
+      guide = if (show_linetype_legend) "legend" else "none"
+    ) +
+    theme_classic() +
+    theme(
+      legend.position = if (show_linetype_legend) "bottom" else "none",
+      axis.title = element_blank(),
+      axis.text = element_text(size = 9, color = "black"),
+      plot.margin = margin(2, 2, 2, 2)
+    )
+
+  if (!show_y_axis) {
+    p <- p + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank())
+  }
+  return(p)
+}
+
+# ==========================================
+# 4. BUILD & LAYOUT (Revised for Clipping & Spacing)
+# ==========================================
+metrics_levels <- levels(df_plot$Metric)
+panel_list <- list()
+
+for (r_idx in seq_along(metrics_levels)) {
+  for (c_idx in 1:3) {
+    show_legend <- (r_idx == 1 && c_idx == 1)
+    name <- paste0("panel_", r_idx, "_", c_idx)
+    
+    # We remove the custom 'Samples per feature' logic from inside the loop
+    # to avoid overlapping with the legend
+    p_temp <- make_per_pair_panel(df_plot, c_idx, metrics_levels[r_idx], (c_idx == 1), show_legend)
+    
+    panel_list[[name]] <- p_temp
+  }
+}
+
+# 1. Arrange columns
+c1 <- panel_list$panel_1_1 / panel_list$panel_2_1 / panel_list$panel_3_1 / panel_list$panel_4_1 / panel_list$panel_5_1
+c2 <- panel_list$panel_1_2 / panel_list$panel_2_2 / panel_list$panel_3_2 / panel_list$panel_4_2 / panel_list$panel_5_2
+c3 <- panel_list$panel_1_3 / panel_list$panel_2_3 / panel_list$panel_3_3 / panel_list$panel_4_3 / panel_list$panel_5_3
+
+# 2. Define Label Functions
+cr <- function(t) wrap_elements(textGrob(t, rot = 90, gp = gpar(fontsize = 10, fontface = "bold")))
+col_hdr <- function(t) wrap_elements(textGrob(t, gp = gpar(fontsize = 12, fontface = "bold")))
+
+# 3. Assemble the Header Row (Reduced height via layout)
+header_row <- plot_spacer() + col_hdr("Component 1") + col_hdr("Component 2") + col_hdr("Component 3") + 
+              plot_layout(widths = c(0.12, 1, 1, 1))
+
+# 4. Assemble the Main Body
+body_row <- (
+  (cr("Power") / cr("Relative association\nstrength error") / cr("Weight error") / cr("Score error") / cr("Loading error")) |
+  c1 | c2 | c3
+) + plot_layout(widths = c(0.12, 1, 1, 1))
+
+# 5. Final Assembly
+final_plot <- (header_row / body_row) + 
+  # heights = c(0.02, 1) makes the header row very thin
+  plot_layout(heights = c(0.015, 1), guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    # Reduce top margin (t) to 2, and bottom (b) to 2
+    plot.margin = margin(t = 2, r = 10, b = 10, l = 10), 
+    legend.margin = margin(t = 0, b = 0),
+    legend.box.margin = margin(t = -5, b = 0)
+  ) &
+  labs(
+    linetype = expression(paste("Samples per feature     (", p[x] + p[y] == 64, ")    ", p[x])),
+    # Adding X label here as a global label so it doesn't overlap the legend
+    x = "Samples per feature" 
+  )
+
+ggsave("Fig3_3D.pdf", final_plot, width = 11, height = 17)
+```
+
+# Figure 3 (1 Component)
+```{r}
+plan(multisession, workers = 8)
+options(future.globals.maxSize = 8 * 1024^3)
+
+results_dir <- "cca_px_plus_py_64_1d_results"
+if (!dir.exists(results_dir)) dir.create(results_dir)
+
+# ==========================================
+# 1. CORE BATCH FUNCTION
+# ==========================================
+run_stability_batch_k1 <- function(px, py, cond_name, r_true, n_rep_obs, n_sigmas, n_per_ftr_vec) {
+  k <- 1
+  message(sprintf("\n>>> STARTING: px=%d, py=%d (sum=%d)", px, py, px + py))
+
+  for (mod in 1:n_sigmas) {
+    file_path <- sprintf(
+      "%s/%s_px%d_py%d_r%s_mod%d.rds",
+      results_dir, cond_name, px, py,
+      paste(round(r_true, 2), collapse = "-"), mod
+    )
+    if (file.exists(file_path)) next
+
+    model <- generate_cca_population(p_x = px, p_y = py, r_true = r_true)
+
+    batch_results <- purrr::map_df(n_per_ftr_vec, function(n_ptf) {
+      n_total <- ceiling(n_ptf * px)
+
+      # Skip unstable case
+      if (n_total <= max(px, py)) {
+        return(data.frame(
+          Canonical_Pair = 1:k,
+          Power_Raw = NA,
+          Rel_Assoc_Err = NA,
+          Weight_Err = NA,
+          Score_Err = NA,
+          Load_Err = NA,
+          n_per_ftr = n_ptf
+        ))
+      }
+
+      # Compute power
+      p_raw <- if (n_ptf > 256) 1.0 else compute_power_1d(
+        joint_cov = model$joint_cov,
+        p_x = px, n = n_total,
+        num_datasets = n_rep_obs,
+        num_permutations = 100
+      )
+
+      # Replicate for error metrics
+      draws <- replicate(n_rep_obs, {
+        tryCatch({
+          cca_fit <- solve_cca_dataset(model$joint_cov, n_total, px, k)
+          if (is.null(cca_fit)) return(NULL)
+          rel_err <- relative_error(cca_fit$r_obs, r_true)
+          weight_err <- weight_error_k(cca_fit$WX_hat, cca_fit$WY_hat, model$W_X, model$W_Y)
+          score_load <- score_loading_error_k(cca_fit, model$W_X, model$W_Y)
+          data.frame(
+            Canonical_Pair = 1,
+            Rel_Assoc_Err = rel_err,
+            Weight_Err = weight_err,
+            Score_Err = score_load$score,
+            Load_Err = score_load$loading
+          )
+        }, error = function(e) NULL)
+      }, simplify = FALSE)
+
+      draws <- draws[!sapply(draws, is.null)]
+      if (length(draws) == 0) {
+        return(data.frame(
+          Canonical_Pair = 1,
+          Power_Raw = NA,
+          Rel_Assoc_Err = NA,
+          Weight_Err = NA,
+          Score_Err = NA,
+          Load_Err = NA,
+          n_per_ftr = n_ptf
+        ))
+      }
+
+      dplyr::bind_rows(draws) %>%
+        dplyr::group_by(Canonical_Pair) %>%
+        dplyr::summarise(dplyr::across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+        dplyr::mutate(Power_Raw = p_raw, n_per_ftr = n_ptf)
+    })
+
+    saveRDS(
+      batch_results %>% dplyr::mutate(px = px, py = py, mod = mod, r_true_label = paste(round(r_true, 2), collapse = "-"), cond = cond_name),
+      file_path
+    )
+  }
+}
+
+# ==========================================
+# 2. TASK GRID
+# ==========================================
+n_rep_obs <- 100
+n_per_ftr_vec <- c(3, 8, 16, 32, 64, 128, 256, 512, 1000)
+r_true_vec_list <- list(c(0.1), c(0.3), c(0.7))
+n_sigmas <- 10
+px_vals <- c(4, 8, 16)
+
+all_tasks <- expand.grid(px = px_vals, r_idx = seq_along(r_true_vec_list))
+all_tasks$py <- 64 - all_tasks$px
+all_tasks$cond <- "px_plus_py_64"
+
+# ==========================================
+# 3. PARALLEL EXECUTION
+# ==========================================
+results <- future_lapply(1:nrow(all_tasks), function(i) {
+  task <- all_tasks[i, ]
+  cat(sprintf("\n[Task %d/%d] px=%d, py=%d\n", i, nrow(all_tasks), task$px, task$py))
+  tryCatch({
+    run_stability_batch_k1(
+      px = task$px, py = task$py, cond_name = task$cond,
+      r_true = r_true_vec_list[[task$r_idx]],
+      n_rep_obs = n_rep_obs, n_sigmas = n_sigmas, n_per_ftr_vec = n_per_ftr_vec
+    )
+    "OK"
+  }, error = function(e) {
+    msg <- sprintf("FAILED: px=%d py=%d | %s", task$px, task$py, e$message)
+    cat(msg, "\n")
+    msg
+  })
+}, future.seed = TRUE)
+```
+
+```{r}
+# ==========================================
+# 1. COLORS & REFERENCE DATA
+# ==========================================
+color_map_raw <- c(
+  "0.10" = "#96F3A6",
+  "0.30" = "#45ADA8",
+  "0.70" = "#00008B"
+)
+
+# ==========================================
+# 2. DATA LOADING (Keeping your original logic)
+# ==========================================
+results_dir_64 <- "cca_px_plus_py_64_1d_results"
+results_dir_bal <- "cca_multi_px_1d_results"
+
+files_64 <- list.files(results_dir_64, pattern = "\\.rds$", full.names = TRUE)
+files_32 <- list.files(results_dir_bal, pattern = "px32.*\\.rds$", full.names = TRUE)
+all_files <- c(files_64, files_32)
+
+df_raw <- map_df(all_files, function(f) {
+  data <- readRDS(f)
+  if ("Power_Bonf" %in% colnames(data)) data <- rename(data, Power_Raw = Power_Bonf)
+  return(data)
+})
+
+df_plot <- df_raw %>%
+  mutate(
+    r_label = coalesce(as.character(r_true_label), as.character(r_true)),
+    val_str = sprintf("%.2f", as.numeric(r_label))
+  ) %>%
+  pivot_longer(
+    cols = any_of(c("Power_Raw", "Rel_Assoc_Err", "Weight_Err", "Score_Err", "Load_Err")),
+    names_to = "Metric", values_to = "Value"
+  ) %>%
+  mutate(
+    px_f = factor(px, levels = c(4, 8, 16, 32)),
+    Metric = factor(Metric,
+                    levels = c("Power_Raw", "Rel_Assoc_Err", "Weight_Err", "Score_Err", "Load_Err"),
+                    labels = c("Power", "Relative association\nstrength error", 
+                               "Weight error", "Score error", "Loading error")),
+    Value = pmax(Value, 1e-4)
+  )
+# ==========================================
+# 3. PANEL FUNCTION (Updated for bottom X-axis label)
+# ==========================================
+make_panel <- function(df_data, metric_name, show_y_axis = FALSE, is_last_panel = FALSE) {
+  sub_df <- df_data %>% filter(Metric == metric_name)
+  if (nrow(sub_df) == 0) return(ggplot() + theme_void())
+
+  p <- ggplot(sub_df, aes(x = n_per_ftr, y = Value, color = val_str, linetype = px_f)) +
+    stat_summary(fun = mean, geom = "line", linewidth = 0.8) +
+    scale_x_log10(limits = c(3, 1100), breaks = c(10, 100, 1000),
+                  labels = expression(10^1, 10^2, 10^3)) +
+    scale_y_log10(limits = c(1e-3, 1.2), breaks = c(1e-3, 1e-2, 1e-1, 1),
+                  labels = expression(10^-3, 10^-2, 10^-1, 10^0)) +
+    scale_color_manual(values = color_map_raw, guide = "legend") + 
+    scale_linetype_manual(
+      values = c("4" = "dotted", "8" = "dotdash", "16" = "dashed", "32" = "solid"),
+      labels = c("4" = "4", "8" = "8", "16" = "16", "32" = "32")
+    ) +
+    theme_classic() +
+    theme(
+      axis.title.y = element_blank(),
+      axis.title.x = if (is_last_panel) element_text(size = 11) else element_blank(),
+      axis.text = element_text(size = 9, color = "black"),
+      plot.margin = margin(2, 2, 2, 2)
+    ) +
+    # This adds the label text specifically if it's the last panel
+    labs(x = if (is_last_panel) "Samples per feature" else NULL)
+
+  if (!show_y_axis) {
+    p <- p + theme(axis.text.y = element_blank(),
+                   axis.ticks.y = element_blank(),
+                   axis.line.y = element_blank())
+  }
+  
+  return(p)
+}
+
+# ==========================================
+# 4. BUILD & LAYOUT
+# ==========================================
+metrics_levels <- levels(df_plot$Metric)
+
+# We check if the metric is the last one in the levels list
+panel_list <- map(metrics_levels, function(m) {
+  is_last <- (m == tail(metrics_levels, 1))
+  make_panel(df_plot, m, show_y_axis = TRUE, is_last_panel = is_last)
+})
+
+# Arrange vertically
+final_plot <- wrap_plots(panel_list, ncol = 1, guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.margin = margin(t = 10) # Adds a little space between the x-axis and the legend
+  ) &
+  labs(linetype = expression(p[x]), color = expression(r[true]))
+
+# Save
+ggsave("Fig3_1D.pdf", final_plot, width = 5, height = 14)
+```

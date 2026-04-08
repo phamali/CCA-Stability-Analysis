@@ -1,0 +1,2077 @@
+---
+title: "STA496 Final Code"
+author: "Jianyang Xiao"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+install.packages('CCA')
+library(CCA)
+library(tidyverse)
+```
+
+# Univariate CCA
+
+## Make population
+
+### Generate within set covariance
+
+```{r}
+# power-law eigenvalue/spectrum vector sigma_i = c * i^{-a}
+power_law_sigma <- function(c, a, p) {
+  stopifnot(length(c) == 1, length(a) == 1, length(p) == 1)
+  if (!is.numeric(c) || !is.numeric(a) || !is.numeric(p)) stop("c, a, p must be numeric.")
+  if (p <= 0 || p != as.integer(p)) stop("p must be a positive integer.")
+  if (c <= 0) stop("c must be > 0 to make a valid covariance.")
+  
+  i <- seq_len(p)
+  sigma <- c * (i ^ (a))
+  return(sigma)
+}
+
+# generate Sigma_XX and Sigma_YY (both diagonal)
+generate_within_set_cov <- function(c_xx, c_yy, a_xx, a_yy, p_x, p_y,
+                                    check_monotone = TRUE) {
+  sigma_x <- power_law_sigma(c = c_xx, a = a_xx, p = p_x)
+  sigma_y <- power_law_sigma(c = c_yy, a = a_yy, p = p_y)
+  
+  if (any(!is.finite(sigma_x)) || any(!is.finite(sigma_y))) {
+    stop("Non-finite values in sigma. Check c/a/p.")
+  }
+  if (any(sigma_x <= 0) || any(sigma_y <= 0)) {
+    stop("All sigma entries must be > 0 for a valid (PD) diagonal covariance.")
+  }
+  
+  if (check_monotone) {
+    # "Decay" here means sigma_1 >= sigma_2 >= ... >= sigma_p
+    if (any(diff(sigma_x) > 0)) warning("sigma_x is not non-increasing; check sign/magnitude of a_xx.")
+    if (any(diff(sigma_y) > 0)) warning("sigma_y is not non-increasing; check sign/magnitude of a_yy.")
+  }
+  
+  Sigma_xx <- diag(sigma_x, nrow = p_x, ncol = p_x)
+  Sigma_yy <- diag(sigma_y, nrow = p_y, ncol = p_y)
+  
+  return(list(
+    Sigma_XX = Sigma_xx,
+    Sigma_YY = Sigma_yy,
+    sigma_XX = sigma_x,
+    sigma_YY = sigma_y
+  ))
+}
+```
+
+### Generate weights
+
+```{r}
+# draw one unit Euclidean vector
+draw_unit_vector <- function(p) {
+  z <- rnorm(p)
+  nz <- sqrt(sum(z^2))
+  if (nz == 0) stop("Zero-norm draw (extremely unlikely).")
+  z / nz
+}
+
+# quadratic form for diagonal Sigma
+quad_form_diag <- function(w, sigma) {
+  sum(sigma * w^2)
+}
+
+# Eq (11) check
+passes_eq11 <- function(tilde_w, sigma, factor = 1/2) {
+  p <- ncol(sigma)
+  lhs <- quad_form_diag(tilde_w, sigma)
+  rhs <- factor * (sum(sigma) / p)  # factor * tr(Sigma)/p
+  list(pass = (lhs > rhs), lhs = lhs, rhs = rhs)
+}
+
+# Eq (10) normalization
+normalize_eq10 <- function(tilde_w, sigma) {
+  denom2 <- quad_form_diag(tilde_w, sigma)  # tilde_w^T Sigma tilde_w
+  if (denom2 <= 0) stop("Non-positive quadratic form; sigma must be > 0.")
+  tilde_w / sqrt(denom2)
+}
+
+# generate a CCA weight vector
+generate_weight_one_mode <- function(sigma, factor = 1/2, max_tries = 100000, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  p <- ncol(sigma)
+  if (any(sigma < 0)) stop("All sigma entries must be > 0.")
+
+  for (k in seq_len(max_tries)) {
+    tilde_w <- draw_unit_vector(p)          # ||tilde_w||_2 = 1
+    chk <- passes_eq11(tilde_w, sigma, factor = factor)
+    if (chk$pass) {
+      w <- normalize_eq10(tilde_w, sigma)   # now w^T Sigma w = 1
+
+      return(list(
+        tilde_w = tilde_w,
+        w = w,
+        tries = k,
+        eq11_lhs = chk$lhs,
+        eq11_rhs = chk$rhs
+      ))
+    }
+  }
+  stop("Failed to find a tilde_w passing Eq (11) within max_tries. Consider lowering factor or max_tries.")
+}
+
+# generate both W_X and W_Y (rank-1)
+generate_Wx_Wy_eq10eq11 <- function(sigma_xx, sigma_yy, factor = 1/2, max_tries = 100000, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  out_x <- generate_weight_one_mode(sigma_xx, factor = factor, max_tries = max_tries)
+  out_y <- generate_weight_one_mode(sigma_yy, factor = factor, max_tries = max_tries)
+  list(
+    W_X = matrix(out_x$w, ncol = 1),
+    W_Y = matrix(out_y$w, ncol = 1),
+    details_X = out_x,
+    details_Y = out_y
+  )
+}
+```
+
+### Compute U, V, and S
+
+```{r}
+mat_sqrt_spd <- function(Sigma, inverse = FALSE, tol = 1e-12) {
+  # If Sigma is given as diagonal entries
+  if (is.vector(Sigma)) {
+    if (any(Sigma <= 0)) stop("Diagonal entries must be > 0.")
+    d <- if (!inverse) sqrt(Sigma) else 1 / sqrt(Sigma)
+    return(diag(d, nrow = length(d), ncol = length(d)))
+  }
+  
+  # Sigma is a matrix
+  if (!is.matrix(Sigma)) stop("Sigma must be a vector (diag) or a matrix.")
+  if (nrow(Sigma) != ncol(Sigma)) stop("Sigma must be square.")
+  
+  # Fast path: (approximately) diagonal
+  off_diag <- Sigma
+  diag(off_diag) <- 0
+  if (max(abs(off_diag)) < tol) {
+    d0 <- diag(Sigma)
+    if (any(d0 <= 0)) stop("Diagonal entries must be > 0.")
+    d <- if (!inverse) sqrt(d0) else 1 / sqrt(d0)
+    return(diag(d, nrow = length(d), ncol = length(d)))
+  }
+  
+  # eigen decomposition
+  eig <- eigen(Sigma, symmetric = TRUE)
+  if (any(eig$values <= tol)) stop("Sigma not SPD (non-positive eigenvalues).")
+  vals <- if (!inverse) sqrt(eig$values) else 1 / sqrt(eig$values)
+  eig$vectors %*% diag(vals) %*% t(eig$vectors)
+}
+
+# For rank-1 (m=1) or multi-mode if r is a vector of length m
+compute_uvs_from_weights <- function(Sigma_XX, Sigma_YY, W_X, W_Y, r_true) {
+  if (!is.matrix(W_X)) W_X <- matrix(W_X, ncol = 1)
+  if (!is.matrix(W_Y)) W_Y <- matrix(W_Y, ncol = 1)
+  m <- ncol(W_X)
+  if (ncol(W_Y) != m) stop("W_X and W_Y must have the same number of columns (m).")
+  
+  # S
+  if (length(r_true) == 1) {
+    S <- diag(rep(r_true, m), nrow = m, ncol = m)
+  } else {
+    if (length(r_true) != m) stop("If r_true is a vector, it must have length m.")
+    S <- diag(r_true, nrow = m, ncol = m)
+  }
+  
+  sqrt_x <- mat_sqrt_spd(Sigma_XX, inverse = FALSE)
+  sqrt_y <- mat_sqrt_spd(Sigma_YY, inverse = FALSE)
+  
+  U <- sqrt_x %*% W_X
+  V <- sqrt_y %*% W_Y
+  
+  list(U = U, V = V, S = S)
+}
+```
+
+### Generate between set covariance
+
+```{r}
+# Generate between-set covariance Sigma_XY for CCA
+generate_Sigma_XY <- function(Sigma_XX, Sigma_YY, W_X, W_Y, r_true,
+                              allow_negative = FALSE) {
+  # Coerce weights to matrices
+  if (!is.matrix(W_X)) W_X <- matrix(W_X, ncol = 1)
+  if (!is.matrix(W_Y)) W_Y <- matrix(W_Y, ncol = 1)
+
+  p_x <- nrow(W_X)
+  p_y <- nrow(W_Y)
+  m   <- ncol(W_X)
+  if (ncol(W_Y) != m) stop("W_X and W_Y must have the same number of columns (m).")
+
+  # r_true to S
+  if (length(r_true) == 1) {
+    r_vec <- rep(r_true, m)
+  } else {
+    if (length(r_true) != m) stop("If r_true is a vector, it must have length m.")
+    r_vec <- r_true
+  }
+
+  if (!allow_negative && any(r_vec < 0)) stop("CCA uses nonnegative canonical correlations; r_true should be >= 0.")
+  if (any(abs(r_vec) >= 1)) stop("Need |r_true| < 1 for a valid joint covariance (strict PD typically).")
+
+  S <- diag(r_vec, nrow = m, ncol = m)
+
+  # Decide if Sigma_XX / Sigma_YY are diagonal vectors or full matrices
+  is_diagvec_x <- is.vector(Sigma_XX) && !is.list(Sigma_XX)
+  is_diagvec_y <- is.vector(Sigma_YY) && !is.list(Sigma_YY)
+
+  if (is_diagvec_x) {
+    if (length(Sigma_XX) != p_x) stop("Length of diagonal vector Sigma_XX must equal nrow(W_X).")
+    if (any(Sigma_XX <= 0)) stop("Sigma_XX diagonal entries must be > 0.")
+    # A = Sigma_XX W_X = diag(sigma_x) W_X  (rowwise multiply)
+    A <- sweep(W_X, 1, Sigma_XX, "*")
+  } else {
+    if (!is.matrix(Sigma_XX) || nrow(Sigma_XX) != p_x || ncol(Sigma_XX) != p_x)
+      stop("Sigma_XX must be p_x x p_x matrix or length p_x diagonal vector.")
+    A <- Sigma_XX %*% W_X
+  }
+
+  if (is_diagvec_y) {
+    if (length(Sigma_YY) != p_y) stop("Length of diagonal vector Sigma_YY must equal nrow(W_Y).")
+    if (any(Sigma_YY <= 0)) stop("Sigma_YY diagonal entries must be > 0.")
+    # B = Sigma_YY W_Y = diag(sigma_y) W_Y
+    B <- sweep(W_Y, 1, Sigma_YY, "*")
+  } else {
+    if (!is.matrix(Sigma_YY) || nrow(Sigma_YY) != p_y || ncol(Sigma_YY) != p_y)
+      stop("Sigma_YY must be p_y x p_y matrix or length p_y diagonal vector.")
+    B <- Sigma_YY %*% W_Y
+  }
+  
+  Sigma_XY <- A %*% S %*% t(B)
+  return(Sigma_XY)
+}
+
+```
+
+### Generate covariance
+
+```{r}
+assemble_joint_cov <- function(Sigma_XX, Sigma_YY, Sigma_XY) {
+  # Determine dimensions
+  p_x <- nrow(Sigma_XY)
+  p_y <- ncol(Sigma_XY)
+
+  # Convert Sigma_XX
+  if (is.vector(Sigma_XX) && !is.list(Sigma_XX)) {
+    if (length(Sigma_XX) != p_x) stop("Length of Sigma_XX diagonal vector must equal nrow(Sigma_XY).")
+    Sigma_xx_mat <- diag(Sigma_XX, nrow = p_x, ncol = p_x)
+  } else {
+    if (!is.matrix(Sigma_XX) || nrow(Sigma_XX) != p_x || ncol(Sigma_XX) != p_x) {
+      stop("Sigma_XX must be p_x x p_x matrix or length p_x diagonal vector.")
+    }
+    Sigma_xx_mat <- Sigma_XX
+  }
+
+  # Convert Sigma_YY
+  if (is.vector(Sigma_YY) && !is.list(Sigma_YY)) {
+    if (length(Sigma_YY) != p_y) stop("Length of Sigma_YY diagonal vector must equal ncol(Sigma_XY).")
+    Sigma_yy_mat <- diag(Sigma_YY, nrow = p_y, ncol = p_y)
+  } else {
+    if (!is.matrix(Sigma_YY) || nrow(Sigma_YY) != p_y || ncol(Sigma_YY) != p_y) {
+      stop("Sigma_YY must be p_y x p_y matrix or length p_y diagonal vector.")
+    }
+    Sigma_yy_mat <- Sigma_YY
+  }
+
+  # Assemble
+  Sigma <- rbind(
+    cbind(Sigma_xx_mat, Sigma_XY),
+    cbind(t(Sigma_XY), Sigma_yy_mat)
+  )
+
+  # Symmetrize to remove tiny numerical asymmetry
+  Sigma <- (Sigma + t(Sigma)) / 2
+  Sigma
+}
+
+# Quick PD check using Cholesky
+is_pos_def <- function(Sigma) {
+  Sigma <- (Sigma + t(Sigma)) / 2
+  ok <- TRUE
+  chol_try <- tryCatch(chol(Sigma), error = function(e) { ok <<- FALSE; NULL })
+  ok
+}
+```
+
+## Helper functions
+
+### Population CCA
+
+```{r}
+make_population_cca <- function(
+  c_xx = 1, c_yy = 1,
+  a_xx = -1, a_yy = -1,
+  p_x = 100, p_y = 100,
+  r_true = 0.3,
+  seed = 1,
+  make_pd = TRUE,
+  eps = 1e-10
+) {
+  set.seed(seed)
+
+  covs <- generate_within_set_cov(c_xx, c_yy, a_xx, a_yy, p_x, p_y)
+  Sigma_XX <- covs$Sigma_XX
+  Sigma_YY <- covs$Sigma_YY
+
+  # Generate weights using Eq10/Eq11
+  w_try <- tryCatch(
+    generate_Wx_Wy_eq10eq11(Sigma_XX, Sigma_YY, seed = seed),
+    error = function(e) NULL
+  )
+  if (is.null(w_try)) {
+    w_try <- generate_Wx_Wy_eq10eq11(covs$sigma_XX, covs$sigma_YY, seed = seed)
+  }
+
+  W_X <- w_try$W_X
+  W_Y <- w_try$W_Y
+
+  Sigma_XY <- generate_Sigma_XY(Sigma_XX, Sigma_YY, W_X, W_Y, r_true)
+  Sigma <- assemble_joint_cov(Sigma_XX, Sigma_YY, Sigma_XY)
+
+  Sigma <- (Sigma + t(Sigma)) / 2
+  if (make_pd && exists("is_pos_def") && exists("make_pos_def")) {
+    if (!is_pos_def(Sigma)) Sigma <- make_pos_def(Sigma, eps = eps)
+  }
+
+  list(
+    Sigma = Sigma,
+    Sigma_XX = Sigma_XX,
+    Sigma_YY = Sigma_YY,
+    Sigma_XY = Sigma_XY,
+    wX_true = as.numeric(W_X[, 1]),
+    wY_true = as.numeric(W_Y[, 1]),
+    p_x = p_x,
+    p_y = p_y,
+    r_true = r_true
+  )
+}
+```
+
+### Darw sample and sample CCA
+
+```{r}
+# Hybrid draw of sample covariance: Wishart when df >= d, else explicit sampling
+draw_sample_cov_hybrid <- function(Sigma, n, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  d <- ncol(Sigma)
+  n <- max(as.integer(n), 3)
+
+  if ((n - 1) >= d) {
+    W <- stats::rWishart(1, df = n - 1, Sigma = Sigma)[,,1]
+    return(W / (n - 1))
+  }
+
+  # explicit sampling (cheap when n small)
+  Sig <- (Sigma + t(Sigma)) / 2
+  R <- chol(Sig + 1e-12 * diag(d))
+  Z <- matrix(rnorm(n * d), nrow = n, ncol = d)
+  X <- scale(Z %*% R, center = TRUE, scale = FALSE)
+  crossprod(X) / (n - 1)
+}
+
+cca_from_sample_cov_1 <- function(Sxx, Syy, Sxy) {
+
+  ex <- eigen(Sxx, symmetric = TRUE)
+  ey <- eigen(Syy, symmetric = TRUE)
+
+  invsqrt_x <- ex$vectors %*% diag(1 / sqrt(pmax(ex$values, 1e-10))) %*% t(ex$vectors)
+  invsqrt_y <- ey$vectors %*% diag(1 / sqrt(pmax(ey$values, 1e-10))) %*% t(ey$vectors)
+
+  M <- invsqrt_x %*% Sxy %*% invsqrt_y
+  sv <- svd(M)
+
+  u1 <- sv$u[, 1]
+  v1 <- sv$v[, 1]
+
+  wX_hat <- as.numeric(invsqrt_x %*% u1)
+  wY_hat <- as.numeric(invsqrt_y %*% v1)
+
+  list(r_hat = sv$d[1], wX_hat = wX_hat, wY_hat = wY_hat)
+}
+
+normalize_eq10 <- function(tilde_w, sigma) {
+  denom2 <- quad_form_diag(tilde_w, sigma)  # tilde_w^T Sigma tilde_w
+  if (denom2 <= 0) stop("Non-positive quadratic form; sigma must be > 0.")
+  tilde_w / sqrt(denom2)
+}
+
+align_sign <- function(w_hat, w_true) {
+  s <- sign(sum(w_hat * w_true))
+  if (s == 0) s <- 1
+  s * w_hat
+}
+```
+
+### Weight stability, Cosine similarity, and PC1
+
+```{r}
+if (!exists("cos_sim")) {
+  cos_sim <- function(a, b) {
+    a <- as.numeric(a); b <- as.numeric(b)
+    sum(a*b) / (sqrt(sum(a^2))*sqrt(sum(b^2)) + 1e-12)
+  }
+}
+
+# E|cos(u, e1)| for random unit u in R^p
+expected_abs_cos_random <- function(p) {
+  if (p <= 1) return(1)
+  2/(p - 1) * exp(lgamma(p/2) - 0.5*log(pi) - lgamma((p - 1)/2))
+}
+
+pc1_from_cov <- function(Sxx) {
+  eg <- eigen(Sxx, symmetric = TRUE)
+  v <- eg$vectors[, 1]
+  as.numeric(v / sqrt(sum(v^2)))
+}
+
+stability_from_xy_weight_matrices <- function(WX, WY) {
+  WX <- sweep(WX, 2, sqrt(colSums(WX^2)), "/")
+  WY <- sweep(WY, 2, sqrt(colSums(WY^2)), "/")
+  
+  GX <- abs(crossprod(WX))
+  GY <- abs(crossprod(WY))
+  
+  idx <- upper.tri(GX)
+  mean(pmin(GX[idx], GY[idx]))
+}
+```
+
+## Figure 4 (a)
+
+### Loop over spf values
+
+```{r}
+# Set parameter values
+spf_vec <- c(4, 64, 1024)
+c_xx <- 1
+c_yy <- 1
+a_xx <- -1
+a_yy <- -1
+p_x <- 100
+p_y <- 100
+r_true <- 0.3
+factor <- 1/2
+seed_pop <- 1008913972
+
+# Create population object
+pop <- make_population_cca(
+  c_xx = c_xx,
+  c_yy = c_yy,
+  a_xx = a_xx,
+  a_yy = a_yy,
+  p_x = p_x,
+  p_y = p_y,
+  r_true = r_true,
+  seed = seed_pop
+)
+
+# Total dimension
+p_total <- p_x + p_y
+
+# Empty list to store results
+out <- vector("list", length(spf_vec))
+
+# Loop over samples-per-feature values
+for (i in seq_along(spf_vec)) {
+  
+  spf <- spf_vec[i]
+  n <- as.integer(round(spf * p_total))
+  
+  # Draw sample covariance
+  S <- draw_sample_cov_hybrid(pop$Sigma, n = n, seed = seed_pop + spf)
+  
+  # Extract covariance blocks
+  Sxx <- S[1:p_x, 1:p_x]
+  Syy <- S[(p_x + 1):(p_x + p_y), (p_x + 1):(p_x + p_y)]
+  Sxy <- S[1:p_x, (p_x + 1):(p_x + p_y)]
+  
+  # Fit CCA from sample covariance
+  fit <- cca_from_sample_cov_1(Sxx, Syy, Sxy)
+  
+  # Normalize and align estimated X weights
+  wX_hat <- normalize_eq10(fit$wX_hat, pop$Sigma_XX)
+  wX_hat <- align_sign(wX_hat, pop$wX_true)
+  
+  # Store result for this spf
+  out[[i]] <- data.frame(
+    pc = 1:p_x,
+    diff = wX_hat - pop$wX_true,
+    samples_per_feature = factor(spf, levels = spf_vec)
+  )
+}
+
+# Combine all results into one data frame
+df4a <- do.call(rbind, out)
+```
+
+### Plot
+
+```{r}
+p4a <- ggplot(df4a, aes(x = pc, y = diff, color = samples_per_feature)) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    x = "Principal component",
+    y = "X Weight - true X weight",
+    color = "smpls / ftr"
+  ) +
+  theme_classic()
+
+print(p4a)
+```
+
+## Figure 4 (c)
+
+### Loop over covariance models
+
+```{r}
+spf_grid <- unique(round(exp(seq(log(2), log(500), length.out = 25))))
+spf_grid <- sort(spf_grid)
+n_cov <- 15
+n_rep <- 25
+ridge <- 1e-8
+seed <- 1008913972
+```
+
+```{r}
+out <- vector("list", length = n_cov * length(spf_grid))
+k <- 1
+
+for (cov_id in seq_len(n_cov)) {
+  pop <- make_population_cca(
+    c_xx, c_yy, a_xx, a_yy, p_x, p_y,
+    r_true = r_true,
+    seed = seed + cov_id
+  )
+
+  for (spf in spf_grid) {
+    n <- as.integer(round(spf * (p_x + p_y)))  # samples per feature = n / (p_x + p_y)
+    n <- max(n, 3)
+
+    WX <- matrix(NA_real_, nrow = p_x, ncol = n_rep)
+    WY <- matrix(NA_real_, nrow = p_y, ncol = n_rep)
+
+    for (r in seq_len(n_rep)) {
+      Shat <- draw_sample_cov_hybrid(
+        pop$Sigma,
+        n = n,
+        seed = seed + 1e6 * cov_id + 1000 * spf + r
+      )
+      
+      Sxx <- Shat[1:p_x, 1:p_x]
+      Syy <- Shat[(p_x + 1):(p_x + p_y), (p_x + 1):(p_x + p_y)]
+      Sxy <- Shat[1:p_x, (p_x + 1):(p_x + p_y)]
+
+      fit <- cca_from_sample_cov_1(Sxx, Syy, Sxy)
+      wX_hat <- normalize_eq10(fit$wX_hat, pop$Sigma_XX)
+      wX_hat <- align_sign(wX_hat, pop$wX_true)
+      wY_hat <- normalize_eq10(fit$wY_hat, pop$Sigma_YY)
+      wY_hat <- align_sign(wY_hat, pop$wY_true)
+      WX[, r] <- wX_hat
+      WY[, r] <- wY_hat
+    }
+
+    stab <- stability_from_xy_weight_matrices(WX, WY)
+
+    out[[k]] <- data.frame(
+      cov_id = cov_id,
+      samples_per_feature = spf,
+      stability = stab
+    )
+    k <- k + 1
+  }
+}
+
+df <- do.call(rbind, out)
+
+df_avg <- aggregate(stability ~ samples_per_feature, data = df, FUN = mean)
+df_avg$cov_id <- "avg"
+```
+
+### Plot
+
+```{r}
+out4c <- list(dashed = df, avg = df_avg)
+df_dashed <- out4c$dashed
+df_avg    <- out4c$avg
+
+ggplot() +
+  geom_line(
+    data = df_dashed,
+    aes(x = samples_per_feature, y = stability, group = cov_id),
+    linetype = "dashed", alpha = 0.25
+  ) +
+  geom_line(
+    data = df_avg,
+    aes(x = samples_per_feature, y = stability),
+    linewidth = 1.2
+  ) +
+  labs(x = "Samples per feature", y = "Weight stability") +
+  theme_classic()
+```
+
+```{r}
+out4c <- list(dashed = df, avg = df_avg)
+df_dashed <- out4c$dashed
+df_avg    <- out4c$avg
+
+p4c <- ggplot() +
+  geom_line(
+    data = df_dashed,
+    aes(x = samples_per_feature, y = stability, group = cov_id),
+    linetype = "dashed", alpha = 0.25
+  ) +
+  geom_line(
+    data = df_avg,
+    aes(x = samples_per_feature, y = stability),
+    linewidth = 1.2
+  ) +
+  labs(x = "Samples per feature", y = "Weight stability") +
+  theme_classic()
+
+print(p4c)
+```
+
+## Figure 4 (e)
+
+### Loop
+
+```{r}
+r_true_vals <- c(0.1, 0.5)
+p_vals <- c(2, 4, 8, 16, 32, 64)
+spf_grid <- seq(5, 200, by = 5)
+
+n_cov <- 5
+n_draw <- 50
+ridge <- 1e-10
+seed <- 1008913972
+
+rows <- list()
+k <- 1
+```
+
+```{r}
+for (r_true in r_true_vals) {
+  for (p in p_vals) {
+
+    baseline <- expected_abs_cos_random(p)
+    e1 <- c(1, rep(0, p - 1))
+
+    for (cov_id in seq_len(n_cov)) {
+      pop <- make_population_cca(
+        p_x = p, p_y = p,
+        r_true = r_true,
+        seed = seed + 10000 * cov_id + 17 * p + round(100 * r_true)
+      )
+
+      for (spf in spf_grid) {
+        n <- as.integer(round(spf * (p + p)))
+
+        vals <- numeric(n_draw)
+        for (b in seq_len(n_draw)) {
+          Shat <- draw_sample_cov_hybrid(
+            pop$Sigma, n = n,
+            seed = seed + 1e6 * cov_id + 1000 * spf + b + 99 * p
+          )
+          Sxx <- Shat[1:p, 1:p]
+          Syy <- Shat[(p + 1):(p + p), (p + 1):(p + p)]
+          Sxy <- Shat[1:p, (p + 1):(p + p)]
+
+          fit <- cca_from_sample_cov_1(Sxx, Syy, Sxy)
+          wX_hat <- normalize_eq10(fit$wX_hat, pop$Sigma_XX)
+          wX_hat <- align_sign(wX_hat, pop$wX_true)
+          ax <- eigen(Sxx, symmetric = TRUE)$vectors[, 1]
+          vals[b] <- abs(cos_sim(wX_hat, ax)) - baseline
+          #vals[b] <- abs(cos_sim(wX_hat, e1)) - baseline
+        }
+
+        rows[[k]] <- data.frame(
+          r_true = r_true,
+          samples_per_feature = spf,
+          value = vals
+        )
+        k <- k + 1
+      }
+    }
+  }
+}
+
+df <- do.call(rbind, rows)
+```
+
+### Plot
+
+```{r}
+df4e <- df %>%
+  group_by(r_true, samples_per_feature) %>%
+  summarise(
+    mean = mean(value),
+    lo = quantile(value, 0.025),
+    hi = quantile(value, 0.975),
+    .groups = "drop"
+  )
+
+p4e_1dim <- ggplot(
+  df4e,
+  aes(
+    x = samples_per_feature, y = mean,
+    color = factor(r_true), fill = factor(r_true)
+  )
+) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.25, color = NA) +
+  geom_line(linewidth = 1.1) +
+  labs(
+    x = "Samples per feature",
+    y = "Avg. weight PC1 similarity\n(data - random)",
+    color = "r_true", fill = "r_true"
+  ) +
+  theme_classic()
+
+print(p4e_1dim)
+```
+
+## Figure 6
+
+### Loop
+
+```{r}
+r_true_vals <- c(0.0, 0.1, 0.3, 0.5)
+p_vals <- c(2, 4, 8, 16, 32, 64)
+spf_grid <- seq(1, 60, by = 1)
+
+n_cov <- 5
+n_draw <- 50
+ridge <- 1e-10
+seed <- 1
+
+rows <- list()
+k <- 1
+```
+
+```{r}
+for (r_true in r_true_vals) {
+  for (p in p_vals) {
+    for (cov_id in seq_len(n_cov)) {
+
+      pop <- make_population_cca(
+        p_x = p, p_y = p,
+        r_true = r_true,
+        seed = seed + 10000 * cov_id + 19 * p + round(100 * r_true)
+      )
+
+      for (spf in spf_grid) {
+        n <- as.integer(round(spf * (p + p)))
+
+        rhat <- numeric(n_draw)
+        for (b in seq_len(n_draw)) {
+          Shat <- draw_sample_cov_hybrid(
+            pop$Sigma, n = n,
+            seed = seed + 1e6 * cov_id + 1000 * spf + b + 7 * p
+          )
+          Sxx <- Shat[1:p, 1:p]
+          Syy <- Shat[(p + 1):(p + p), (p + 1):(p + p)]
+          Sxy <- Shat[1:p, (p + 1):(p + p)]
+          fit <- cca_from_sample_cov(Sxx, Syy, Sxy)
+          rhat[b] <- fit$r_hat
+        }
+
+        rows[[k]] <- data.frame(
+          r_true = r_true,
+          samples_per_feature = spf,
+          r_hat = rhat
+        )
+        k <- k + 1
+      }
+    }
+  }
+}
+
+df <- do.call(rbind, rows)
+
+```
+
+### Plot
+
+```{r}
+df6 <- df %>%
+  group_by(r_true, samples_per_feature) %>%
+  summarise(
+    mean = mean(r_hat),
+    lo = quantile(r_hat, 0.025),
+    hi = quantile(r_hat, 0.975),
+    .groups = "drop"
+  )
+
+p6_1dim <- ggplot(
+  df6,
+  aes(
+    x = samples_per_feature, y = mean,
+    color = factor(r_true), fill = factor(r_true)
+  )
+) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1.1) +
+  labs(
+    x = "Samples per feature",
+    y = "Observed correlation",
+    color = "r_true", fill = "r_true"
+  ) +
+  theme_classic()
+
+print(p6_1dim)
+```
+
+# Multivariate CCA
+
+## Make population
+
+### Generate within set covariance
+
+```{r}
+# power-law eigenvalue/spectrum vector sigma_i = c * i^{-a}
+power_law_sigma <- function(c, a, p) {
+  stopifnot(length(c) == 1, length(a) == 1, length(p) == 1)
+  if (!is.numeric(c) || !is.numeric(a) || !is.numeric(p)) stop("c, a, p must be numeric.")
+  if (p <= 0 || p != as.integer(p)) stop("p must be a positive integer.")
+  if (c <= 0) stop("c must be > 0 to make a valid covariance.")
+  
+  i <- seq_len(p)
+  sigma <- c * (i ^ (a))
+  return(sigma)
+}
+
+# generate Sigma_XX and Sigma_YY (both diagonal)
+generate_within_set_cov <- function(c_xx, c_yy, a_xx, a_yy, p_x, p_y,
+                                    check_monotone = TRUE) {
+  sigma_x <- power_law_sigma(c = c_xx, a = a_xx, p = p_x)
+  sigma_y <- power_law_sigma(c = c_yy, a = a_yy, p = p_y)
+  
+  if (any(!is.finite(sigma_x)) || any(!is.finite(sigma_y))) {
+    stop("Non-finite values in sigma. Check c/a/p.")
+  }
+  if (any(sigma_x <= 0) || any(sigma_y <= 0)) {
+    stop("All sigma entries must be > 0 for a valid (PD) diagonal covariance.")
+  }
+  
+  if (check_monotone) {
+    # "Decay" here means sigma_1 >= sigma_2 >= ... >= sigma_p
+    if (any(diff(sigma_x) > 0)) warning("sigma_x is not non-increasing; check sign/magnitude of a_xx.")
+    if (any(diff(sigma_y) > 0)) warning("sigma_y is not non-increasing; check sign/magnitude of a_yy.")
+  }
+  
+  Sigma_xx <- diag(sigma_x, nrow = p_x, ncol = p_x)
+  Sigma_yy <- diag(sigma_y, nrow = p_y, ncol = p_y)
+  
+  return(list(
+    Sigma_XX = Sigma_xx,
+    Sigma_YY = Sigma_yy,
+    sigma_XX = sigma_x,
+    sigma_YY = sigma_y
+  ))
+}
+```
+
+### Generate weights
+
+```{r}
+# draw one unit Euclidean vector
+draw_unit_vector <- function(p) {
+  z <- rnorm(p)
+  nz <- sqrt(sum(z^2))
+  if (nz == 0) stop("Zero-norm draw (extremely unlikely).")
+  z / nz
+}
+
+# draw p x r matrix with Euclidean-orthonormal columns
+draw_orthonormal_matrix <- function(p, r) {
+  Z <- matrix(rnorm(p * r), nrow = p, ncol = r)
+  qr.Q(qr(Z), complete = FALSE)
+}
+
+# helper: trace(Sigma) for either a full matrix or diagonal vector
+trace_sigma <- function(sigma) {
+  if (is.vector(sigma)) return(sum(sigma))
+  sum(diag(sigma))
+}
+
+# helper: number of rows / columns in Sigma
+sigma_dim <- function(sigma) {
+  if (is.vector(sigma)) return(length(sigma))
+  ncol(sigma)
+}
+
+# quadratic form w^T Sigma w for one vector
+quad_form_diag <- function(w, sigma) {
+  if (is.vector(sigma)) {
+    sum(sigma * w^2)
+  } else {
+    as.numeric(crossprod(w, sigma %*% w))
+  }
+}
+
+# matrix quadratic form trace(W^T Sigma W)
+quad_form_diag_mat <- function(W, sigma) {
+  W <- as.matrix(W)
+  if (is.vector(sigma)) {
+    sum(W^2 * sigma)
+  } else {
+    sum(diag(crossprod(W, sigma %*% W)))
+  }
+}
+
+# inverse square root of a small SPD matrix
+mat_inv_sqrt_spd_small <- function(M, tol = 1e-12) {
+  eig <- eigen((M + t(M)) / 2, symmetric = TRUE)
+  vals <- eig$values
+  vecs <- eig$vectors
+
+  if (any(vals <= tol)) {
+    stop("Matrix is not sufficiently positive definite for inverse square root.")
+  }
+
+  vecs %*% diag(1 / sqrt(vals), nrow = length(vals)) %*% t(vecs)
+}
+
+# Eq (11) check for multi-mode tilde_W
+# natural r-dimensional extension:
+# tr(tilde_W^T Sigma tilde_W) > factor * r * tr(Sigma) / p
+passes_eq11_multi <- function(tilde_W, sigma, factor = 1/2) {
+  tilde_W <- as.matrix(tilde_W)
+  p <- sigma_dim(sigma)
+  r <- ncol(tilde_W)
+
+  if (nrow(tilde_W) != p) {
+    stop("tilde_W row dimension must match Sigma dimension.")
+  }
+
+  lhs <- quad_form_diag_mat(tilde_W, sigma)
+  rhs <- factor * r * trace_sigma(sigma) / p
+
+  list(pass = (lhs > rhs), lhs = lhs, rhs = rhs)
+}
+
+# Eq (10) normalization for matrix weights:
+# W = tilde_W (tilde_W^T Sigma tilde_W)^(-1/2)
+# so that W^T Sigma W = I_r
+normalize_eq10_matrix <- function(tilde_W, sigma, tol = 1e-12) {
+  tilde_W <- as.matrix(tilde_W)
+
+  if (is.vector(sigma)) {
+    G <- crossprod(tilde_W, sweep(tilde_W, 1, sigma, "*"))
+  } else {
+    G <- crossprod(tilde_W, sigma %*% tilde_W)
+  }
+
+  G_inv_sqrt <- mat_inv_sqrt_spd_small(G, tol = tol)
+  tilde_W %*% G_inv_sqrt
+}
+
+# generate a CCA weight matrix W with r columns
+generate_weight_multi_mode <- function(sigma, r,
+                                       factor = 1/2,
+                                       max_tries = 100000,
+                                       seed = NULL,
+                                       tol = 1e-12) {
+  if (!is.null(seed)) set.seed(seed)
+
+  p <- sigma_dim(sigma)
+  if (r > p) stop("r must be <= p.")
+
+  if (is.vector(sigma)) {
+    if (any(sigma <= 0)) stop("All sigma diagonal entries must be > 0.")
+  } else {
+    if (!is.matrix(sigma) || nrow(sigma) != ncol(sigma)) {
+      stop("sigma must be a square covariance matrix (or diagonal vector).")
+    }
+  }
+
+  for (k in seq_len(max_tries)) {
+    tilde_W <- draw_orthonormal_matrix(p, r)   # tilde_W^T tilde_W = I_r
+    chk <- passes_eq11_multi(tilde_W, sigma, factor = factor)
+
+    if (chk$pass) {
+      W <- normalize_eq10_matrix(tilde_W, sigma, tol = tol)  # now W^T Sigma W = I_r
+
+      return(list(
+        tilde_W = tilde_W,
+        W = W,
+        tries = k,
+        eq11_lhs = chk$lhs,
+        eq11_rhs = chk$rhs
+      ))
+    }
+  }
+
+  stop("Failed to find a tilde_W passing multivariate Eq (11) within max_tries.")
+}
+
+# generate both W_X and W_Y for rank-r CCA
+generate_Wx_Wy_eq10eq11 <- function(sigma_xx, sigma_yy, r = 3,
+                                    factor = 1/2,
+                                    max_tries = 100000,
+                                    seed = NULL,
+                                    tol = 1e-12) {
+  if (!is.null(seed)) set.seed(seed)
+
+  out_x <- generate_weight_multi_mode(
+    sigma = sigma_xx,
+    r = r,
+    factor = factor,
+    max_tries = max_tries,
+    seed = NULL,
+    tol = tol
+  )
+
+  out_y <- generate_weight_multi_mode(
+    sigma = sigma_yy,
+    r = r,
+    factor = factor,
+    max_tries = max_tries,
+    seed = NULL,
+    tol = tol
+  )
+
+  list(
+    W_X = out_x$W,
+    W_Y = out_y$W,
+    details_X = out_x,
+    details_Y = out_y
+  )
+}
+```
+
+### Compute U, V, and S
+
+```{r}
+mat_sqrt_spd <- function(Sigma, inverse = FALSE, tol = 1e-12) {
+  # If Sigma is given as diagonal entries
+  if (is.vector(Sigma)) {
+    if (any(Sigma <= 0)) stop("Diagonal entries must be > 0.")
+    d <- if (!inverse) sqrt(Sigma) else 1 / sqrt(Sigma)
+    return(diag(d, nrow = length(d), ncol = length(d)))
+  }
+  
+  # Sigma is a matrix
+  if (!is.matrix(Sigma)) stop("Sigma must be a vector (diag) or a matrix.")
+  if (nrow(Sigma) != ncol(Sigma)) stop("Sigma must be square.")
+  
+  # Fast path: (approximately) diagonal
+  off_diag <- Sigma
+  diag(off_diag) <- 0
+  if (max(abs(off_diag)) < tol) {
+    d0 <- diag(Sigma)
+    if (any(d0 <= 0)) stop("Diagonal entries must be > 0.")
+    d <- if (!inverse) sqrt(d0) else 1 / sqrt(d0)
+    return(diag(d, nrow = length(d), ncol = length(d)))
+  }
+  
+  # eigen decomposition
+  eig <- eigen(Sigma, symmetric = TRUE)
+  if (any(eig$values <= tol)) stop("Sigma not SPD (non-positive eigenvalues).")
+  vals <- if (!inverse) sqrt(eig$values) else 1 / sqrt(eig$values)
+  eig$vectors %*% diag(vals) %*% t(eig$vectors)
+}
+
+# For rank-1 (m=1) or multi-mode if r is a vector of length m
+compute_uvs_from_weights <- function(Sigma_XX, Sigma_YY, W_X, W_Y, r_true) {
+  if (!is.matrix(W_X)) W_X <- matrix(W_X, ncol = 1)
+  if (!is.matrix(W_Y)) W_Y <- matrix(W_Y, ncol = 1)
+  m <- ncol(W_X)
+  if (ncol(W_Y) != m) stop("W_X and W_Y must have the same number of columns (m).")
+  
+  # S
+  if (length(r_true) == 1) {
+    S <- diag(rep(r_true, m), nrow = m, ncol = m)
+  } else {
+    if (length(r_true) != m) stop("If r_true is a vector, it must have length m.")
+    S <- diag(r_true, nrow = m, ncol = m)
+  }
+  
+  sqrt_x <- mat_sqrt_spd(Sigma_XX, inverse = FALSE)
+  sqrt_y <- mat_sqrt_spd(Sigma_YY, inverse = FALSE)
+  
+  U <- sqrt_x %*% W_X
+  V <- sqrt_y %*% W_Y
+  
+  list(U = U, V = V, S = S)
+}
+```
+
+### Generate between set covariance
+
+```{r}
+# Generate between-set covariance Sigma_XY for CCA
+generate_Sigma_XY <- function(Sigma_XX, Sigma_YY, W_X, W_Y, r_true,
+                              allow_negative = FALSE) {
+  # Coerce weights to matrices
+  if (!is.matrix(W_X)) W_X <- matrix(W_X, ncol = 1)
+  if (!is.matrix(W_Y)) W_Y <- matrix(W_Y, ncol = 1)
+
+  p_x <- nrow(W_X)
+  p_y <- nrow(W_Y)
+  m   <- ncol(W_X)
+  if (ncol(W_Y) != m) stop("W_X and W_Y must have the same number of columns (m).")
+
+  # r_true to S
+  if (length(r_true) == 1) {
+    r_vec <- rep(r_true, m)
+  } else {
+    if (length(r_true) != m) stop("If r_true is a vector, it must have length m.")
+    r_vec <- r_true
+  }
+
+  if (!allow_negative && any(r_vec < 0)) stop("CCA uses nonnegative canonical correlations; r_true should be >= 0.")
+  if (any(abs(r_vec) >= 1)) stop("Need |r_true| < 1 for a valid joint covariance (strict PD typically).")
+
+  S <- diag(r_vec, nrow = m, ncol = m)
+
+  # Decide if Sigma_XX / Sigma_YY are diagonal vectors or full matrices
+  is_diagvec_x <- is.vector(Sigma_XX) && !is.list(Sigma_XX)
+  is_diagvec_y <- is.vector(Sigma_YY) && !is.list(Sigma_YY)
+
+  if (is_diagvec_x) {
+    if (length(Sigma_XX) != p_x) stop("Length of diagonal vector Sigma_XX must equal nrow(W_X).")
+    if (any(Sigma_XX <= 0)) stop("Sigma_XX diagonal entries must be > 0.")
+    # A = Sigma_XX W_X = diag(sigma_x) W_X  (rowwise multiply)
+    A <- sweep(W_X, 1, Sigma_XX, "*")
+  } else {
+    if (!is.matrix(Sigma_XX) || nrow(Sigma_XX) != p_x || ncol(Sigma_XX) != p_x)
+      stop("Sigma_XX must be p_x x p_x matrix or length p_x diagonal vector.")
+    A <- Sigma_XX %*% W_X
+  }
+
+  if (is_diagvec_y) {
+    if (length(Sigma_YY) != p_y) stop("Length of diagonal vector Sigma_YY must equal nrow(W_Y).")
+    if (any(Sigma_YY <= 0)) stop("Sigma_YY diagonal entries must be > 0.")
+    # B = Sigma_YY W_Y = diag(sigma_y) W_Y
+    B <- sweep(W_Y, 1, Sigma_YY, "*")
+  } else {
+    if (!is.matrix(Sigma_YY) || nrow(Sigma_YY) != p_y || ncol(Sigma_YY) != p_y)
+      stop("Sigma_YY must be p_y x p_y matrix or length p_y diagonal vector.")
+    B <- Sigma_YY %*% W_Y
+  }
+  
+  Sigma_XY <- A %*% S %*% t(B)
+  return(Sigma_XY)
+}
+
+```
+
+### Generate covariance
+
+```{r}
+assemble_joint_cov <- function(Sigma_XX, Sigma_YY, Sigma_XY) {
+  # Determine dimensions
+  p_x <- nrow(Sigma_XY)
+  p_y <- ncol(Sigma_XY)
+
+  # Convert Sigma_XX
+  if (is.vector(Sigma_XX) && !is.list(Sigma_XX)) {
+    if (length(Sigma_XX) != p_x) stop("Length of Sigma_XX diagonal vector must equal nrow(Sigma_XY).")
+    Sigma_xx_mat <- diag(Sigma_XX, nrow = p_x, ncol = p_x)
+  } else {
+    if (!is.matrix(Sigma_XX) || nrow(Sigma_XX) != p_x || ncol(Sigma_XX) != p_x) {
+      stop("Sigma_XX must be p_x x p_x matrix or length p_x diagonal vector.")
+    }
+    Sigma_xx_mat <- Sigma_XX
+  }
+
+  # Convert Sigma_YY
+  if (is.vector(Sigma_YY) && !is.list(Sigma_YY)) {
+    if (length(Sigma_YY) != p_y) stop("Length of Sigma_YY diagonal vector must equal ncol(Sigma_XY).")
+    Sigma_yy_mat <- diag(Sigma_YY, nrow = p_y, ncol = p_y)
+  } else {
+    if (!is.matrix(Sigma_YY) || nrow(Sigma_YY) != p_y || ncol(Sigma_YY) != p_y) {
+      stop("Sigma_YY must be p_y x p_y matrix or length p_y diagonal vector.")
+    }
+    Sigma_yy_mat <- Sigma_YY
+  }
+
+  # Assemble
+  Sigma <- rbind(
+    cbind(Sigma_xx_mat, Sigma_XY),
+    cbind(t(Sigma_XY), Sigma_yy_mat)
+  )
+
+  # Symmetrize to remove tiny numerical asymmetry
+  Sigma <- (Sigma + t(Sigma)) / 2
+  Sigma
+}
+
+# Quick PD check using Cholesky
+is_pos_def <- function(Sigma) {
+  Sigma <- (Sigma + t(Sigma)) / 2
+  ok <- TRUE
+  chol_try <- tryCatch(chol(Sigma), error = function(e) { ok <<- FALSE; NULL })
+  ok
+}
+```
+
+## Helper functions
+
+### Population CCA
+
+```{r}
+expand_r_true <- function(r_true, r) {
+  if (length(r_true) == 1L) {
+    rep(as.numeric(r_true), r)
+  } else {
+    if (length(r_true) != r) stop("If r_true is a vector, it must have length r.")
+    as.numeric(r_true)
+  }
+}
+
+make_population_cca <- function(
+  c_xx = 1, c_yy = 1,
+  a_xx = -1, a_yy = -1,
+  p_x = 100, p_y = 100,
+  r = 3,
+  r_true = c(0.7, 0.5, 0.3),
+  factor = 1/2,
+  seed = 1,
+  max_tries = 100000,
+  make_pd = TRUE,
+  eps = 1e-10,
+  tol = 1e-12
+) {
+  set.seed(seed)
+
+  if (r > min(p_x, p_y)) stop("r must be <= min(p_x, p_y).")
+
+  covs <- generate_within_set_cov(c_xx, c_yy, a_xx, a_yy, p_x, p_y)
+  Sigma_XX <- covs$Sigma_XX
+  Sigma_YY <- covs$Sigma_YY
+
+  r_vec <- expand_r_true(r_true, r)
+  if (any(r_vec < 0) || any(r_vec >= 1)) {
+    stop("For regular CCA, r_true entries must satisfy 0 <= r_true < 1.")
+  }
+
+  weights <- generate_Wx_Wy_eq10eq11(
+    sigma_xx = Sigma_XX,
+    sigma_yy = Sigma_YY,
+    r = r,
+    factor = factor,
+    max_tries = max_tries,
+    seed = seed,
+    tol = tol
+  )
+
+  W_X <- weights$W_X
+  W_Y <- weights$W_Y
+
+  UVS <- compute_uvs_from_weights(Sigma_XX, Sigma_YY, W_X, W_Y, r_true)
+  U_true <- UVS$U
+  V_true <- UVS$V
+  S <- UVS$S
+  Sigma_XY <- generate_Sigma_XY(
+    Sigma_XX = Sigma_XX,
+    Sigma_YY = Sigma_YY,
+    W_X = W_X,
+    W_Y = W_Y,
+    r_true = r_vec
+  )
+
+  Sigma <- assemble_joint_cov(Sigma_XX, Sigma_YY, Sigma_XY)
+  Sigma <- (Sigma + t(Sigma)) / 2
+
+  if (make_pd && exists("is_pos_def") && exists("make_pos_def")) {
+    if (!is_pos_def(Sigma)) Sigma <- make_pos_def(Sigma, eps = eps)
+  }
+
+  out <- list(
+    Sigma = Sigma,
+    Sigma_XX = Sigma_XX,
+    Sigma_YY = Sigma_YY,
+    Sigma_XY = Sigma_XY,
+
+    U_true = U_true,
+    V_true = V_true,
+    W_X_true = W_X,
+    W_Y_true = W_Y,
+
+    S_true = S,
+    r_true = r_vec,
+    r = r,
+    p_x = p_x,
+    p_y = p_y,
+
+    details_X = weights$details_X,
+    details_Y = weights$details_Y,
+    tries_X = weights$details_X$tries,
+    tries_Y = weights$details_Y$tries
+  )
+
+  # convenience aliases for r = 3
+  if (r >= 1) {
+    out$wX_1_true <- W_X[, 1]
+    out$wY_1_true <- W_Y[, 1]
+  }
+  if (r >= 2) {
+    out$wX_2_true <- W_X[, 2]
+    out$wY_2_true <- W_Y[, 2]
+  }
+  if (r >= 3) {
+    out$wX_3_true <- W_X[, 3]
+    out$wY_3_true <- W_Y[, 3]
+  }
+
+  out
+}
+```
+
+### Draw sample and sample CCA
+
+```{r}
+# Hybrid draw of sample covariance: Wishart when df >= d, else explicit sampling
+draw_sample_cov_hybrid <- function(Sigma, n, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  d <- ncol(Sigma)
+  n <- max(as.integer(n), 3)
+
+  if ((n - 1) >= d) {
+    W <- stats::rWishart(1, df = n - 1, Sigma = Sigma)[,,1]
+    return(W / (n - 1))
+  }
+
+  Sig <- (Sigma + t(Sigma)) / 2
+  R <- chol(Sig + 1e-12 * diag(d))
+  Z <- matrix(rnorm(n * d), nrow = n, ncol = d)
+  X <- scale(Z %*% R, center = TRUE, scale = FALSE)
+  crossprod(X) / (n - 1)
+}
+
+# Multivariate CCA from sample covariance blocks
+cca_from_sample_cov <- function(Sxx, Syy, Sxy, r = 3, ridge = 1e-10) {
+  Sxx <- (Sxx + t(Sxx)) / 2 + diag(ridge, nrow(Sxx))
+  Syy <- (Syy + t(Syy)) / 2 + diag(ridge, nrow(Syy))
+
+  p_x <- nrow(Sxx)
+  p_y <- nrow(Syy)
+  r <- min(as.integer(r), p_x, p_y)
+  if (r < 1) stop("r must be at least 1.")
+
+  invsqrt_x <- mat_sqrt_spd(Sxx, inverse = TRUE)
+  invsqrt_y <- mat_sqrt_spd(Syy, inverse = TRUE)
+
+  M <- invsqrt_x %*% Sxy %*% invsqrt_y
+  sv <- svd(M)
+
+  U_hat <- sv$u[, seq_len(r), drop = FALSE]
+  V_hat <- sv$v[, seq_len(r), drop = FALSE]
+  W_X_hat <- invsqrt_x %*% U_hat
+  W_Y_hat <- invsqrt_y %*% V_hat
+  r_hat <- pmin(pmax(sv$d[seq_len(r)], 0), 1)
+
+  list(
+    r_hat = as.numeric(r_hat),
+    U_hat = U_hat,
+    V_hat = V_hat,
+    W_X_hat = W_X_hat,
+    wX_1_hat = as.numeric(W_X_hat[, 1]),
+    wX_2_hat = as.numeric(W_X_hat[, 2]),
+    wX_3_hat = as.numeric(W_X_hat[, 3]),
+    W_Y_hat = W_Y_hat,
+    wY_1_hat = as.numeric(W_Y_hat[, 1]),
+    wY_2_hat = as.numeric(W_Y_hat[, 2]),
+    wY_3_hat = as.numeric(W_Y_hat[, 3]),
+    M = M,
+    r_hat = r_hat
+  )
+}
+
+normalize_eq10 <- function(tilde_w, sigma) {
+  denom2 <- quad_form_diag(tilde_w, sigma)  # tilde_w^T Sigma tilde_w
+  if (denom2 <= 0) stop("Non-positive quadratic form; sigma must be > 0.")
+  tilde_w / sqrt(denom2)
+}
+
+align_sign <- function(w_hat, w_true) {
+  s <- sign(sum(w_hat * w_true))
+  if (s == 0) s <- 1
+  s * w_hat
+}
+```
+
+### Weight stability, Cosine similarity, and PC1
+
+```{r}
+if (!exists("cos_sim")) {
+  cos_sim <- function(a, b) {
+    a <- as.numeric(a); b <- as.numeric(b)
+    sum(a*b) / (sqrt(sum(a^2))*sqrt(sum(b^2)) + 1e-12)
+  }
+}
+
+# E|cos(u, e1)| for random unit u in R^p
+expected_abs_cos_random <- function(p) {
+  if (p <= 1) return(1)
+  2/(p - 1) * exp(lgamma(p/2) - 0.5*log(pi) - lgamma((p - 1)/2))
+}
+
+pc1_from_cov <- function(Sxx) {
+  eg <- eigen(Sxx, symmetric = TRUE)
+  v <- eg$vectors[, 1]
+  as.numeric(v / sqrt(sum(v^2)))
+}
+
+stability_from_xy_weight_matrices <- function(WX, WY) {
+  WX <- sweep(WX, 2, sqrt(colSums(WX^2)), "/")
+  WY <- sweep(WY, 2, sqrt(colSums(WY^2)), "/")
+  
+  GX <- abs(crossprod(WX))
+  GY <- abs(crossprod(WY))
+  
+  idx <- upper.tri(GX)
+  mean(pmin(GX[idx], GY[idx]))
+}
+```
+
+## Figure 4 (a)
+
+### Loop over spf values
+
+```{r}
+# Set parameter values
+spf_vec <- c(4, 64, 1024)
+c_xx <- 1
+c_yy <- 1
+a_xx <- -1
+a_yy <- -1
+p_x <- 100
+p_y <- 100
+r_true <- c(0.7, 0.5, 0.3)
+factor <- 1/2
+seed_pop <- 1008913972
+
+# Create population object
+pop <- make_population_cca(
+  c_xx = c_xx,
+  c_yy = c_yy,
+  a_xx = a_xx,
+  a_yy = a_yy,
+  p_x = p_x,
+  p_y = p_y,
+  r_true = r_true,
+  seed = seed_pop
+)
+
+# Total dimension
+p_total <- p_x + p_y
+
+# Empty list to store results
+out1 <- vector("list", length(spf_vec))
+out2 <- vector("list", length(spf_vec))
+out3 <- vector("list", length(spf_vec))
+
+# Loop over samples-per-feature values
+for (i in seq_along(spf_vec)) {
+  
+  spf <- spf_vec[i]
+  n <- as.integer(round(spf * p_total))
+  
+  # Draw sample covariance
+  S <- draw_sample_cov_hybrid(pop$Sigma, n = n, seed = seed_pop + spf)
+  
+  # Extract covariance blocks
+  Sxx <- S[1:p_x, 1:p_x]
+  Syy <- S[(p_x + 1):(p_x + p_y), (p_x + 1):(p_x + p_y)]
+  Sxy <- S[1:p_x, (p_x + 1):(p_x + p_y)]
+  
+  fit <- cca_from_sample_cov(Sxx, Syy, Sxy, r = 3)
+  #fit_aligned <- align_cca_fit_repeated(fit, pop, ref = "u")
+  wX_1_hat <- normalize_eq10(fit$W_X_hat[, 1], pop$Sigma_XX)
+  wX_1_hat <- align_sign(wX_1_hat, pop$wX_1_true)
+  wX_2_hat <- normalize_eq10(fit$W_X_hat[, 2], pop$Sigma_XX)
+  wX_2_hat <- align_sign(wX_2_hat, pop$wX_2_true)
+  wX_3_hat <- normalize_eq10(fit$W_X_hat[, 3], pop$Sigma_XX)
+  wX_3_hat <- align_sign(wX_3_hat, pop$wX_3_true)
+  
+  out1[[i]] <- data.frame(
+    pc = 1:p_x,
+    diff = wX_1_hat - pop$wX_1_true,
+    samples_per_feature = factor(spf, levels = spf_vec)
+  )
+  out2[[i]] <- data.frame(
+    pc = 1:p_x,
+    diff = wX_2_hat - pop$wX_2_true,
+    samples_per_feature = factor(spf, levels = spf_vec)
+  )
+  out3[[i]] <- data.frame(
+    pc = 1:p_x,
+    diff = wX_3_hat - pop$wX_3_true,
+    samples_per_feature = factor(spf, levels = spf_vec)
+  )
+}
+
+# Combine all results into one data frame
+df4a1 <- do.call(rbind, out1)
+df4a2 <- do.call(rbind, out2)
+df4a3 <- do.call(rbind, out3)
+```
+
+### Plot
+
+```{r}
+p4a1 <- ggplot(df4a1, aes(x = pc, y = diff, color = samples_per_feature)) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    x = "Principal component",
+    y = "First X Weight - true first X weight",
+    color = "smpls / ftr"
+  ) +
+  theme_classic()
+
+p4a2 <- ggplot(df4a2, aes(x = pc, y = diff, color = samples_per_feature)) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    x = "Principal component",
+    y = "Second X Weight - true second first X weight",
+    color = "smpls / ftr"
+  ) +
+  theme_classic()
+
+p4a3 <- ggplot(df4a3, aes(x = pc, y = diff, color = samples_per_feature)) +
+  geom_line(linewidth = 0.6) +
+  labs(
+    x = "Principal component",
+    y = "Third X Weight - true third X weight",
+    color = "smpls / ftr"
+  ) +
+  theme_classic()
+
+print(p4a1)
+print(p4a2)
+print(p4a3)
+```
+
+## Figure 4 (c)
+
+### Loop over covariance models
+
+```{r}
+spf_grid <- unique(round(exp(seq(log(2), log(500), length.out = 25))))
+spf_grid <- sort(spf_grid)
+n_cov <- 15
+n_rep <- 25
+ridge <- 1e-8
+seed <- 1
+r <- 3
+
+out1 <- vector("list", length = n_cov * length(spf_grid))
+out2 <- vector("list", length = n_cov * length(spf_grid))
+out3 <- vector("list", length = n_cov * length(spf_grid))
+k <- 1
+```
+
+```{r}
+for (cov_id in seq_len(n_cov)) {
+  pop <- make_population_cca(
+    c_xx = c_xx,
+    c_yy = c_yy,
+    a_xx = a_xx,
+    a_yy = a_yy,
+    p_x = p_x,
+    p_y = p_y,
+    r = r,
+    r_true = r_true,
+    seed = seed + cov_id
+  )
+
+  n_mode <- pop$r
+
+  for (spf in spf_grid) {
+    n <- as.integer(round(spf * (p_x + p_y)))
+    n <- max(n, 3)
+
+    WX1 <- matrix(NA_real_, nrow = p_x, ncol = n_rep)
+    WX2 <- matrix(NA_real_, nrow = p_x, ncol = n_rep)
+    WX3 <- matrix(NA_real_, nrow = p_x, ncol = n_rep)
+    WY1 <- matrix(NA_real_, nrow = p_y, ncol = n_rep)
+    WY2 <- matrix(NA_real_, nrow = p_y, ncol = n_rep)
+    WY3 <- matrix(NA_real_, nrow = p_y, ncol = n_rep)
+
+    for (rep_id in seq_len(n_rep)) {
+      Shat <- draw_sample_cov_hybrid(
+        pop$Sigma,
+        n = n,
+        seed = seed + 1e6 * cov_id + 1000 * spf + rep_id
+      )
+
+      Sxx <- Shat[1:p_x, 1:p_x, drop = FALSE]
+      Syy <- Shat[(p_x + 1):(p_x + p_y), (p_x + 1):(p_x + p_y), drop = FALSE]
+      Sxy <- Shat[1:p_x, (p_x + 1):(p_x + p_y), drop = FALSE]
+
+      fit <- cca_from_sample_cov(Sxx, Syy, Sxy, r = n_mode, ridge = ridge)
+      
+      wX_1_hat <- normalize_eq10(fit$W_X_hat[, 1], pop$Sigma_XX)
+      wX_1_hat <- align_sign(wX_1_hat, pop$wX_1_true)
+      wX_2_hat <- normalize_eq10(fit$W_X_hat[, 2], pop$Sigma_XX)
+      wX_2_hat <- align_sign(wX_2_hat, pop$wX_2_true)
+      wX_3_hat <- normalize_eq10(fit$W_X_hat[, 3], pop$Sigma_XX)
+      wX_3_hat <- align_sign(wX_3_hat, pop$wX_3_true)
+      wY_1_hat <- normalize_eq10(wY_1_hat, pop$Sigma_YY)
+      wY_1_hat <- align_sign(wY_1_hat, pop$wY_1_true)
+      wY_2_hat <- normalize_eq10(fit$W_Y_hat[, 2], pop$Sigma_YY)
+      wY_2_hat <- align_sign(wY_2_hat, pop$wY_2_true)
+      wY_3_hat <- normalize_eq10(fit$W_Y_hat[, 3], pop$Sigma_YY)
+      wY_3_hat <- align_sign(wY_3_hat, pop$wY_3_true)
+
+      WX1[, rep_id] <- wX_1_hat
+      WX2[, rep_id] <- wX_2_hat
+      WX3[, rep_id] <- wX_3_hat
+      WY1[, rep_id] <- wY_1_hat
+      WY2[, rep_id] <- wY_2_hat
+      WY3[, rep_id] <- wY_3_hat
+    }
+
+    stab1 <- stability_from_xy_weight_matrices(WX1, WY1)
+    stab2 <- stability_from_xy_weight_matrices(WX2, WY2)
+    stab3 <- stability_from_xy_weight_matrices(WX3, WY3)
+
+    out1[[k]] <- data.frame(
+      cov_id = cov_id,
+      samples_per_feature = spf,
+      stability = stab1
+    )
+    out2[[k]] <- data.frame(
+      cov_id = cov_id,
+      samples_per_feature = spf,
+      stability = stab2
+    )
+    out3[[k]] <- data.frame(
+      cov_id = cov_id,
+      samples_per_feature = spf,
+      stability = stab3
+    )
+    k <- k + 1
+  }
+}
+
+df1 <- do.call(rbind, out1)
+df2 <- do.call(rbind, out2)
+df3 <- do.call(rbind, out3)
+
+df_avg1 <- aggregate(stability ~ samples_per_feature, data = df1, FUN = mean)
+df_avg1$cov_id <- "avg"
+df_avg2 <- aggregate(stability ~ samples_per_feature, data = df2, FUN = mean)
+df_avg2$cov_id <- "avg"
+df_avg3 <- aggregate(stability ~ samples_per_feature, data = df3, FUN = mean)
+df_avg3$cov_id <- "avg"
+```
+
+### Plot
+
+```{r}
+out4c1 <- list(dashed = df1, avg = df_avg1)
+df_dashed1 <- out4c1$dashed
+df_avg1    <- out4c1$avg
+out4c2 <- list(dashed = df2, avg = df_avg2)
+df_dashed2 <- out4c2$dashed
+df_avg2    <- out4c2$avg
+out4c3 <- list(dashed = df3, avg = df_avg3)
+df_dashed3 <- out4c3$dashed
+df_avg3    <- out4c3$avg
+
+p4c1 <- ggplot() +
+  geom_line(
+    data = df_dashed1,
+    aes(x = samples_per_feature, y = stability, group = cov_id),
+    linetype = "dashed", alpha = 0.25
+  ) +
+  geom_line(
+    data = df_avg1,
+    aes(x = samples_per_feature, y = stability),
+    linewidth = 1.2
+  ) +
+  labs(x = "Samples per feature", y = "Weight stability") +
+  theme_classic()
+
+p4c2 <- ggplot() +
+  geom_line(
+    data = df_dashed2,
+    aes(x = samples_per_feature, y = stability, group = cov_id),
+    linetype = "dashed", alpha = 0.25
+  ) +
+  geom_line(
+    data = df_avg2,
+    aes(x = samples_per_feature, y = stability),
+    linewidth = 1.2
+  ) +
+  labs(x = "Samples per feature", y = "Weight stability") +
+  theme_classic()
+
+p4c3 <- ggplot() +
+  geom_line(
+    data = df_dashed3,
+    aes(x = samples_per_feature, y = stability, group = cov_id),
+    linetype = "dashed", alpha = 0.25
+  ) +
+  geom_line(
+    data = df_avg3,
+    aes(x = samples_per_feature, y = stability),
+    linewidth = 1.2
+  ) +
+  labs(x = "Samples per feature", y = "Weight stability") +
+  theme_classic()
+
+print(p4c1)
+print(p4c2)
+print(p4c3)
+```
+
+## Figure 4 (e)
+
+### Low r loop
+
+```{r}
+r_true_vec <- c(0.3, 0.2, 0.1)
+r <- length(r_true_vec)
+
+p_vals <- c(4, 8, 16, 32, 64)
+spf_grid <- seq(5, 200, by = 5)
+
+n_cov <- 5
+n_draw <- 50
+ridge <- 1e-10
+seed <- 1008913972
+
+rows1 <- list()
+k <- 1
+```
+
+```{r}
+for (p in p_vals) {
+
+  baseline <- expected_abs_cos_random(p)
+
+  for (cov_id in seq_len(n_cov)) {
+
+    pop <- make_population_cca(
+      p_x = p,
+      p_y = p,
+      r = r,
+      r_true = r_true_vec,
+      seed = seed + 10000 * cov_id + 17 * p
+    )
+
+    for (spf in spf_grid) {
+      n <- as.integer(round(spf * (p + p)))
+
+      vals_mat1 <- matrix(NA_real_, nrow = n_draw, ncol = r)
+
+      for (b in seq_len(n_draw)) {
+        Shat <- draw_sample_cov_hybrid(
+          pop$Sigma,
+          n = n,
+          seed = seed + 1e6 * cov_id + 1000 * spf + b + 99 * p
+        )
+
+        Sxx <- Shat[1:p, 1:p, drop = FALSE]
+        Syy <- Shat[(p + 1):(2 * p), (p + 1):(2 * p), drop = FALSE]
+        Sxy <- Shat[1:p, (p + 1):(2 * p), drop = FALSE]
+
+        fit <- cca_from_sample_cov(
+          Sxx = Sxx,
+          Syy = Syy,
+          Sxy = Sxy,
+          r = r,
+          ridge = ridge
+        )
+
+        wX_1_hat <- normalize_eq10(fit$W_X_hat[, 1], pop$Sigma_XX)
+        wX_1_hat <- align_sign(wX_1_hat, pop$wX_1_true)
+
+        wX_2_hat <- normalize_eq10(fit$W_X_hat[, 2], pop$Sigma_XX)
+        wX_2_hat <- align_sign(wX_2_hat, pop$wX_2_true)
+
+        wX_3_hat <- normalize_eq10(fit$W_X_hat[, 3], pop$Sigma_XX)
+        wX_3_hat <- align_sign(wX_3_hat, pop$wX_3_true)
+
+        # PC1 of the sample X covariance
+        ax <- eigen(Sxx, symmetric = TRUE)$vectors[, 1]
+
+        vals_mat1[b, 1] <- abs(cos_sim(wX_1_hat, ax)) - baseline
+        vals_mat1[b, 2] <- abs(cos_sim(wX_2_hat, ax)) - baseline
+        vals_mat1[b, 3] <- abs(cos_sim(wX_3_hat, ax)) - baseline
+      }
+
+      rows1[[k]] <- data.frame(
+        mode = rep(seq_len(r), each = n_draw),
+        r_true = rep(r_true_vec, each = n_draw),
+        samples_per_feature = spf,
+        value = c(vals_mat1[, 1], vals_mat1[, 2], vals_mat1[, 3]),
+        p = p,
+        cov_id = cov_id
+      )
+      k <- k + 1
+    }
+  }
+}
+
+dfe1 <- do.call(rbind, rows1)
+```
+
+### Plot low r
+
+```{r}
+df4e1 <- dfe1 %>%
+  group_by(mode, r_true, samples_per_feature) %>%
+  summarise(
+    mean = mean(value),
+    lo = quantile(value, 0.025),
+    hi = quantile(value, 0.975),
+    .groups = "drop"
+  )
+
+df4e1$label <- factor(
+  df4e1$r_true,
+  levels = c(0.3, 0.2, 0.1),
+  labels = c("r_true = 0.3", "r_true = 0.2", "r_true = 0.1")
+)
+
+p4e1 <- ggplot(
+  df4e1,
+  aes(
+    x = samples_per_feature,
+    y = mean,
+    color = label,
+    fill = label
+  )
+) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.25, color = NA) +
+  geom_line(linewidth = 1.1) +
+  labs(
+    x = "Samples per feature",
+    y = "Avg. weight PC1 similarity\n(data - random)",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_classic()
+
+print(p4e1)
+```
+
+### High r loop
+
+```{r}
+r_true_vec <- c(0.7, 0.6, 0.5)
+r <- length(r_true_vec)
+
+p_vals <- c(4, 8, 16, 32, 64)
+spf_grid <- seq(5, 200, by = 5)
+
+n_cov <- 5
+n_draw <- 50
+ridge <- 1e-10
+seed <- 1008913972
+
+rows2 <- list()
+k <- 1
+```
+
+```{r}
+for (p in p_vals) {
+
+  baseline <- expected_abs_cos_random(p)
+
+  for (cov_id in seq_len(n_cov)) {
+
+    pop <- make_population_cca(
+      p_x = p,
+      p_y = p,
+      r = r,
+      r_true = r_true_vec,
+      seed = seed + 10000 * cov_id + 17 * p
+    )
+
+    for (spf in spf_grid) {
+      n <- as.integer(round(spf * (p + p)))
+
+      vals_mat2 <- matrix(NA_real_, nrow = n_draw, ncol = r)
+
+      for (b in seq_len(n_draw)) {
+        Shat <- draw_sample_cov_hybrid(
+          pop$Sigma,
+          n = n,
+          seed = seed + 1e6 * cov_id + 1000 * spf + b + 99 * p
+        )
+
+        Sxx <- Shat[1:p, 1:p, drop = FALSE]
+        Syy <- Shat[(p + 1):(2 * p), (p + 1):(2 * p), drop = FALSE]
+        Sxy <- Shat[1:p, (p + 1):(2 * p), drop = FALSE]
+
+        fit <- cca_from_sample_cov(
+          Sxx = Sxx,
+          Syy = Syy,
+          Sxy = Sxy,
+          r = r,
+          ridge = ridge
+        )
+
+        wX_1_hat <- normalize_eq10(fit$W_X_hat[, 1], pop$Sigma_XX)
+        wX_1_hat <- align_sign(wX_1_hat, pop$wX_1_true)
+
+        wX_2_hat <- normalize_eq10(fit$W_X_hat[, 2], pop$Sigma_XX)
+        wX_2_hat <- align_sign(wX_2_hat, pop$wX_2_true)
+
+        wX_3_hat <- normalize_eq10(fit$W_X_hat[, 3], pop$Sigma_XX)
+        wX_3_hat <- align_sign(wX_3_hat, pop$wX_3_true)
+
+        # PC1 of the sample X covariance
+        ax <- eigen(Sxx, symmetric = TRUE)$vectors[, 1]
+
+        vals_mat2[b, 1] <- abs(cos_sim(wX_1_hat, ax)) - baseline
+        vals_mat2[b, 2] <- abs(cos_sim(wX_2_hat, ax)) - baseline
+        vals_mat2[b, 3] <- abs(cos_sim(wX_3_hat, ax)) - baseline
+      }
+
+      rows2[[k]] <- data.frame(
+        mode = rep(seq_len(r), each = n_draw),
+        r_true = rep(r_true_vec, each = n_draw),
+        samples_per_feature = spf,
+        value = c(vals_mat2[, 1], vals_mat2[, 2], vals_mat2[, 3]),
+        p = p,
+        cov_id = cov_id
+      )
+      k <- k + 1
+    }
+  }
+}
+
+dfe2 <- do.call(rbind, rows2)
+```
+
+### Plot high r
+
+```{r}
+df4e2 <- dfe2 %>%
+  group_by(mode, r_true, samples_per_feature) %>%
+  summarise(
+    mean = mean(value),
+    lo = quantile(value, 0.025),
+    hi = quantile(value, 0.975),
+    .groups = "drop"
+  )
+
+df4e2$label <- factor(
+  df4e2$r_true,
+  levels = c(0.7, 0.6, 0.5),
+  labels = c("r_true = 0.7", "r_true = 0.6", "r_true = 0.5")
+)
+
+p4e2 <- ggplot(
+  df4e2,
+  aes(
+    x = samples_per_feature,
+    y = mean,
+    color = label,
+    fill = label
+  )
+) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.25, color = NA) +
+  geom_line(linewidth = 1.1) +
+  labs(
+    x = "Samples per feature",
+    y = "Avg. weight PC1 similarity\n(data - random)",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_classic()
+
+print(p4e2)
+```
+
+## Figure 6
+
+### Loop
+
+```{r}
+r_true_vals <- c(0.0, 0.1, 0.3, 0.5)
+p_vals <- c(4, 8, 16, 32, 64)
+spf_grid <- seq(1, 60, by = 1)
+
+n_cov <- 5
+n_draw <- 50
+ridge <- 1e-10
+seed <- 1
+
+rows <- list()
+k <- 1
+```
+
+```{r, warning=FALSE}
+for (r_true in r_true_vals) {
+  for (p in p_vals) {
+    for (cov_id in seq_len(n_cov)) {
+
+      pop <- make_population_cca(
+        p_x = p, p_y = p,
+        r_true = r_true,
+        seed = seed + 10000 * cov_id + 19 * p + round(100 * r_true)
+      )
+
+      for (spf in spf_grid) {
+        n <- as.integer(round(spf * (p + p)))
+
+        rhat <- numeric(n_draw)
+        for (b in seq_len(n_draw)) {
+          Shat <- draw_sample_cov_hybrid(
+            pop$Sigma, n = n,
+            seed = seed + 1e6 * cov_id + 1000 * spf + b + 7 * p
+          )
+          Sxx <- Shat[1:p, 1:p]
+          Syy <- Shat[(p + 1):(p + p), (p + 1):(p + p)]
+          Sxy <- Shat[1:p, (p + 1):(p + p)]
+          fit <- cca_from_sample_cov(Sxx, Syy, Sxy)
+          rhat[b] <- fit$r_hat
+        }
+
+        rows[[k]] <- data.frame(
+          r_true = r_true,
+          samples_per_feature = spf,
+          r_hat = rhat
+        )
+        k <- k + 1
+      }
+    }
+  }
+}
+
+df <- do.call(rbind, rows)
+```
+
+### Plot
+
+```{r}
+df6 <- df %>%
+  group_by(r_true, samples_per_feature) %>%
+  summarise(
+    mean = mean(r_hat),
+    lo = quantile(r_hat, 0.025),
+    hi = quantile(r_hat, 0.975),
+    .groups = "drop"
+  )
+
+p6 <- ggplot(
+  df6,
+  aes(
+    x = samples_per_feature, y = mean,
+    color = factor(r_true), fill = factor(r_true)
+  )
+) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1.1) +
+  labs(
+    x = "Samples per feature",
+    y = "Observed correlation",
+    color = "r_true", fill = "r_true"
+  ) +
+  theme_classic()
+
+print(p6)
+```
