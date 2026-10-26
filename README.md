@@ -1,6 +1,6 @@
 # Stability Analysis of Canonical Correlation Analysis (CCA)
 
-> **📄 Read the Full Report:** You can view the complete research paper [here (PDF)](STA496_FinalPaper.pdf).
+> ** Read the Full Report:** You can view the complete research paper [here (PDF)](STA496_FinalPaper.pdf).
 
 An end-to-end generative simulation framework in **R** for evaluating the statistical stability, parameter recovery, and empirical power of **Canonical Correlation Analysis (CCA)** across both univariate ($k = 1$) and multivariate ($k > 1$) canonical settings.
 
